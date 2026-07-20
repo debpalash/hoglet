@@ -27,6 +27,7 @@ use sink::EventSink;
 pub fn app_with_sink(sink: Arc<dyn EventSink>) -> Router {
     Router::new()
         .merge(routes::config::router())
+        .merge(routes::flags::router())
         .merge(capture::router(sink))
         .layer(CorsLayer::very_permissive())
 }

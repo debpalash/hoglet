@@ -61,7 +61,7 @@ Done means: a real app sets `api_host` to Hoglet and works. Nothing else ships b
 
 Explicitly out of scope for now: session replay ingestion, surveys, experiments, data warehouse, CDP, distributed tracing, multi-node replication, native SDKs.
 
-Scope ladder (boss, 2026-07-20): **now** = client+server events, identity, flags. **Later** = error tracking (exceptions are events, same pipeline). **Never** = observability (traces/logs/metrics) — store trace_id as a property, link out to the user's tracing tool. Do not relitigate the "never".
+Scope ladder (boss, 2026-07-20): **now** = client+server events, identity, flags. AI events (`$ai_generation` etc. from PostHog SDKs) are captured for free by compat — no extra work, don't drop them. **Later** = error tracking (exceptions are events, same pipeline), AI analytics dashboard (cost/model/latency views), MCP server exposing the query API to agents. **Never** = observability (traces/logs/metrics, incl. LLM trace waterfalls) — store trace_id as a property, link out to the user's tracing tool. Do not relitigate the "never".
 
 ## Compatibility rules
 

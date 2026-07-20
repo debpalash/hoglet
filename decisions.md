@@ -64,7 +64,7 @@ Stack: Rust (tokio+axum), hand-rolled WAL, Parquet+DuckDB (events), SQLite (OLTP
 - **React over Dioxus/topcoat.** No maintained Rust library does interactive analytics charts; charts are the whole dashboard.
 - **DuckDB over DataFusion**, used read-only as a query engine over Parquet segments. Never a live read-write `.duckdb` file (single-writer wall).
 - **traceparent deferred.** Store the header's trace_id as an event property if free; build no query/UI until users ask. A hypothesis, not a differentiator.
-- **Scope ladder:** now = client+server events, identity, flags. Later = error tracking (exceptions are events). Never = traces/logs/metrics — store trace_id, link out.
+- **Scope ladder:** now = client+server events, identity, flags (AI events captured free via compat). Later = error tracking (exceptions are events), AI analytics dashboard, MCP server over the query API. Never = traces/logs/metrics including LLM trace waterfalls — store trace_id, link out.
 - **One binary, two lanes.** Ingest+WAL get reserved capacity and bounded queues; DuckDB queries run on a capped blocking pool with a memory limit. Ingest always wins under contention.
 
 ## Standing build method

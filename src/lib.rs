@@ -5,8 +5,10 @@
 //! byte-for-byte — anything custom stays behind it.
 
 pub mod capture;
+pub mod flush;
 pub mod routes;
 pub mod sink;
+pub mod store;
 pub mod token;
 pub mod wal;
 

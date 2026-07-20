@@ -25,9 +25,17 @@ pub const MAX_QUEUED_BATCHES: usize = 1024;
 /// Maximum batches folded into one fsync (group commit ceiling).
 const MAX_GROUP_BATCHES: usize = 256;
 
-struct WalRequest {
-    events: Vec<CapturedEvent>,
-    ack: oneshot::Sender<Result<(), SinkError>>,
+enum WalRequest {
+    Append {
+        events: Vec<CapturedEvent>,
+        ack: oneshot::Sender<Result<(), SinkError>>,
+    },
+    /// Roll the active segment (if non-empty) and report every sealed
+    /// segment — segments the writer will never touch again, safe to flush
+    /// to Parquet and delete.
+    Seal {
+        ack: oneshot::Sender<Vec<std::path::PathBuf>>,
+    },
 }
 
 /// Handle for appending; cheap to clone.
@@ -64,11 +72,7 @@ impl Wal {
         for (seq, path) in segment::list_segments(&dir)? {
             let scanned = segment::scan_and_truncate(&path)?;
             truncated |= scanned.truncated;
-            for record in scanned.records {
-                let batch: Vec<CapturedEvent> = serde_json::from_slice(&record)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                events.extend(batch);
-            }
+            events.extend(decode_records(scanned.records)?);
             last_seq = seq;
         }
 
@@ -91,9 +95,20 @@ impl Wal {
     pub async fn append(&self, events: Vec<CapturedEvent>) -> Result<(), SinkError> {
         let (ack, ack_rx) = oneshot::channel();
         self.tx
-            .try_send(WalRequest { events, ack })
+            .try_send(WalRequest::Append { events, ack })
             .map_err(|_| SinkError::Retryable)?;
         ack_rx.await.map_err(|_| SinkError::Retryable)?
+    }
+
+    /// Seal the active segment and return all sealed segment paths, oldest
+    /// first. The writer never appends to a sealed segment again.
+    pub async fn seal(&self) -> Result<Vec<std::path::PathBuf>, SinkError> {
+        let (ack, ack_rx) = oneshot::channel();
+        self.tx
+            .send(WalRequest::Seal { ack })
+            .await
+            .map_err(|_| SinkError::Retryable)?;
+        ack_rx.await.map_err(|_| SinkError::Retryable)
     }
 }
 
@@ -121,10 +136,24 @@ fn writer_loop(dir: PathBuf, mut seq: u64, mut rx: mpsc::Receiver<WalRequest>) {
     let mut buf: Vec<u8> = Vec::new();
 
     while let Some(first) = rx.blocking_recv() {
-        group.push(first);
+        let mut pending_seal: Option<oneshot::Sender<Vec<PathBuf>>> = None;
+
+        match first {
+            WalRequest::Seal { ack } => {
+                seal(&dir, &mut seq, &mut current, ack);
+                continue;
+            }
+            append => group.push(append),
+        }
         while group.len() < MAX_GROUP_BATCHES {
             match rx.try_recv() {
-                Ok(req) => group.push(req),
+                Ok(WalRequest::Seal { ack }) => {
+                    // Handle after this group commits so its batches land in
+                    // the segment being sealed.
+                    pending_seal = Some(ack);
+                    break;
+                }
+                Ok(append) => group.push(append),
                 Err(_) => break,
             }
         }
@@ -132,7 +161,10 @@ fn writer_loop(dir: PathBuf, mut seq: u64, mut rx: mpsc::Receiver<WalRequest>) {
         buf.clear();
         let mut encodable: Vec<bool> = Vec::with_capacity(group.len());
         for req in &group {
-            match serde_json::to_vec(&req.events) {
+            let WalRequest::Append { events, .. } = req else {
+                unreachable!("group holds only appends");
+            };
+            match serde_json::to_vec(events) {
                 Ok(payload) if payload.len() <= segment::MAX_RECORD_BYTES => {
                     segment::encode_record(&payload, &mut buf);
                     encodable.push(true);
@@ -148,13 +180,16 @@ fn writer_loop(dir: PathBuf, mut seq: u64, mut rx: mpsc::Receiver<WalRequest>) {
         }
 
         for (req, ok) in group.drain(..).zip(encodable) {
+            let WalRequest::Append { ack, .. } = req else {
+                unreachable!("group holds only appends");
+            };
             let outcome = match (&result, ok) {
                 (Ok(()), true) => Ok(()),
                 // Unencodable batch: our bug, not retryable by the client.
                 (Ok(()), false) => Err(SinkError::Fatal),
                 (Err(_), _) => Err(SinkError::Retryable),
             };
-            let _ = req.ack.send(outcome);
+            let _ = ack.send(outcome);
         }
 
         // On write failure, reopen a fresh segment: never keep appending
@@ -170,7 +205,46 @@ fn writer_loop(dir: PathBuf, mut seq: u64, mut rx: mpsc::Receiver<WalRequest>) {
                 }
             }
         }
+
+        if let Some(ack) = pending_seal.take() {
+            seal(&dir, &mut seq, &mut current, ack);
+        }
     }
+}
+
+/// Roll the active segment if it has data, then report every segment with
+/// seq < active — those are sealed and safe to flush + delete.
+fn seal(
+    dir: &std::path::Path,
+    seq: &mut u64,
+    current: &mut (std::fs::File, u64),
+    ack: oneshot::Sender<Vec<PathBuf>>,
+) {
+    if current.1 > 0 {
+        match open_segment(dir, *seq + 1) {
+            Ok(pair) => {
+                *seq += 1;
+                *current = pair;
+            }
+            Err(e) => {
+                // Keep writing to the old segment; report only what's
+                // already sealed.
+                tracing::error!("wal: cannot roll segment on seal: {e}");
+            }
+        }
+    }
+    let sealed = match segment::list_segments(dir) {
+        Ok(all) => all
+            .into_iter()
+            .filter(|(s, _)| *s < *seq)
+            .map(|(_, p)| p)
+            .collect(),
+        Err(e) => {
+            tracing::error!("wal: cannot list segments: {e}");
+            Vec::new()
+        }
+    };
+    let _ = ack.send(sealed);
 }
 
 fn open_segment(dir: &std::path::Path, seq: u64) -> std::io::Result<(std::fs::File, u64)> {
@@ -183,8 +257,32 @@ fn open_segment(dir: &std::path::Path, seq: u64) -> std::io::Result<(std::fs::Fi
 
 fn fail_all(rx: &mut mpsc::Receiver<WalRequest>) {
     while let Ok(req) = rx.try_recv() {
-        let _ = req.ack.send(Err(SinkError::Retryable));
+        match req {
+            WalRequest::Append { ack, .. } => {
+                let _ = ack.send(Err(SinkError::Retryable));
+            }
+            WalRequest::Seal { ack } => {
+                let _ = ack.send(Vec::new());
+            }
+        }
     }
+}
+
+fn decode_records(records: Vec<Vec<u8>>) -> std::io::Result<Vec<CapturedEvent>> {
+    let mut events = Vec::new();
+    for record in records {
+        let batch: Vec<CapturedEvent> = serde_json::from_slice(&record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        events.extend(batch);
+    }
+    Ok(events)
+}
+
+/// Read every event in a sealed segment (flusher path). Truncates a torn
+/// tail exactly like startup recovery does.
+pub fn read_segment_events(path: &std::path::Path) -> std::io::Result<Vec<CapturedEvent>> {
+    let scanned = segment::scan_and_truncate(path)?;
+    decode_records(scanned.records)
 }
 
 /// The WAL as the capture pipeline's sink.

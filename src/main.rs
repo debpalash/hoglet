@@ -17,15 +17,20 @@ async fn main() {
     let data_dir = std::path::PathBuf::from(
         std::env::var("HOGLET_DATA").unwrap_or_else(|_| "hoglet-data".into()),
     );
-    let (sink, _wal_runtime, recovered) = hoglet::wal::open_sink(data_dir.join("wal"))
-        .expect("cannot open WAL");
+    let (wal, _wal_runtime, recovered) =
+        hoglet::wal::Wal::open(data_dir.join("wal")).expect("cannot open WAL");
     if !recovered.events.is_empty() {
         tracing::info!(
             count = recovered.events.len(),
             truncated_tail = recovered.truncated,
-            "recovered events from WAL (flush to Parquet pending)"
+            "recovered unflushed events from WAL; flusher will store them"
         );
     }
+    let store = std::sync::Arc::new(
+        hoglet::store::EventStore::open(data_dir.join("events")).expect("cannot open event store"),
+    );
+    hoglet::flush::spawn(wal.clone(), store);
+    let sink = std::sync::Arc::new(hoglet::wal::WalSink(wal));
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

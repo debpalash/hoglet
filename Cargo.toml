@@ -21,6 +21,7 @@ async-trait = "0.1"
 arrow = "59"
 parquet = { version = "59", features = ["arrow"] }
 json5 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

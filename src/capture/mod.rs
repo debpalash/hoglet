@@ -21,7 +21,14 @@ use axum::body::Bytes;
 use chrono::Utc;
 use serde_json::json;
 
+use crate::identity::IdentityStore;
 use crate::sink::EventSink;
+
+#[derive(Clone)]
+pub struct CaptureState {
+    pub sink: Arc<dyn EventSink>,
+    pub identity: Arc<IdentityStore>,
+}
 
 /// Body limit for browser-SDK endpoints (/e and friends).
 pub const MAX_EVENT_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -37,7 +44,7 @@ pub struct CaptureQuery {
     pub beacon: Option<String>,
 }
 
-pub fn router(sink: Arc<dyn EventSink>) -> Router {
+pub fn router(state: CaptureState) -> Router {
     let small = Router::new()
         .route("/e", post(capture))
         .route("/e/", post(capture))
@@ -54,11 +61,11 @@ pub fn router(sink: Arc<dyn EventSink>) -> Router {
         .route("/batch", post(capture))
         .route("/batch/", post(capture))
         .layer(DefaultBodyLimit::max(MAX_BATCH_BODY_BYTES));
-    small.merge(batch).with_state(sink)
+    small.merge(batch).with_state(state)
 }
 
 async fn capture(
-    State(sink): State<Arc<dyn EventSink>>,
+    State(state): State<CaptureState>,
     Query(query): Query<CaptureQuery>,
     headers: HeaderMap,
     body: Bytes,
@@ -93,7 +100,8 @@ async fn capture(
 
     // Empty after filtering is still success — never make clients retry.
     if !batch.events.is_empty() {
-        match sink.append(batch.events).await {
+        let events = batch.events;
+        match state.sink.append(events.clone()).await {
             Ok(()) => {}
             Err(crate::sink::SinkError::Retryable) => {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -102,6 +110,17 @@ async fn capture(
                 return StatusCode::BAD_REQUEST.into_response();
             }
         }
+        // Identity runs after the durability ack decision: person state is
+        // rebuildable from the event log, so a failure here logs rather
+        // than failing an already-durable batch.
+        let identity = state.identity.clone();
+        tokio::task::spawn_blocking(move || {
+            for event in &events {
+                if let Err(e) = identity.process(event) {
+                    tracing::error!("identity processing failed: {e:?}");
+                }
+            }
+        });
     }
 
     if beacon {
@@ -126,7 +145,11 @@ mod tests {
 
     fn app_with_sink() -> (Router, Arc<MemorySink>) {
         let sink = Arc::new(MemorySink::default());
-        (router(sink.clone()), sink)
+        let state = CaptureState {
+            sink: sink.clone(),
+            identity: Arc::new(IdentityStore::in_memory().unwrap()),
+        };
+        (router(state), sink)
     }
 
     async fn post_body(router: Router, uri: &str, body: impl Into<Body>) -> StatusCode {

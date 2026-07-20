@@ -6,6 +6,7 @@
 
 pub mod capture;
 pub mod flush;
+pub mod identity;
 pub mod routes;
 pub mod sink;
 pub mod store;
@@ -17,22 +18,25 @@ use std::sync::Arc;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use sink::EventSink;
+use capture::CaptureState;
 
 /// Build the full application router.
 ///
 /// CORS is maximally permissive by contract (compat-spec.md "Responses"):
 /// old SDKs and reverse proxies send funky headers, and analytics endpoints
 /// are public by nature.
-pub fn app_with_sink(sink: Arc<dyn EventSink>) -> Router {
+pub fn app_with_state(state: CaptureState) -> Router {
     Router::new()
         .merge(routes::config::router())
         .merge(routes::flags::router())
-        .merge(capture::router(sink))
+        .merge(capture::router(state))
         .layer(CorsLayer::very_permissive())
 }
 
-/// Default app: logs events until the WAL lands.
+/// Default app: log sink, in-memory identity. For tests and dry runs.
 pub fn app() -> Router {
-    app_with_sink(Arc::new(sink::LogSink))
+    app_with_state(CaptureState {
+        sink: Arc::new(sink::LogSink),
+        identity: Arc::new(identity::IdentityStore::in_memory().expect("in-memory sqlite")),
+    })
 }

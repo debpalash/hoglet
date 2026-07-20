@@ -30,14 +30,21 @@ async fn main() {
         hoglet::store::EventStore::open(data_dir.join("events")).expect("cannot open event store"),
     );
     hoglet::flush::spawn(wal.clone(), store);
-    let sink = std::sync::Arc::new(hoglet::wal::WalSink(wal));
+    let identity = std::sync::Arc::new(
+        hoglet::identity::IdentityStore::open(&data_dir.join("identity.db"))
+            .expect("cannot open identity store"),
+    );
+    let state = hoglet::capture::CaptureState {
+        sink: std::sync::Arc::new(hoglet::wal::WalSink(wal)),
+        identity,
+    };
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
     tracing::info!("hoglet listening on {addr}");
 
-    axum::serve(listener, hoglet::app_with_sink(sink))
+    axum::serve(listener, hoglet::app_with_state(state))
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
         })

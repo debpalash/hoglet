@@ -1,22 +1,26 @@
 //! Event sink — where accepted events go after the wire edge.
 //!
-//! The WAL (claims.md claim 2) will be the real implementation. Until it
-//! lands, [`MemorySink`] holds events for tests and [`LogSink`] serves the
-//! running binary. The contract stays the same either way: `append` returning
-//! `Ok` is the durability promise that justifies a 2xx to the client, so no
-//! future implementation may ack before its write is durable.
+//! The real implementation is the WAL ([`crate::wal::WalSink`]): `append`
+//! returning `Ok` is the durability promise that justifies a 2xx to the
+//! client, so no implementation may ack before its write is durable.
+//! [`MemorySink`] exists for tests and [`LogSink`] for running without
+//! persistence.
 
 use std::sync::Mutex;
 
 use crate::capture::event::CapturedEvent;
 
-/// A sink failure is retryable by contract → handler returns 503, which
-/// posthog-js retries.
-#[derive(Debug)]
-pub struct SinkFull;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkError {
+    /// Transient failure → 503, which posthog-js retries.
+    Retryable,
+    /// The batch itself can never be stored → 400, never retried.
+    Fatal,
+}
 
+#[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
-    fn append(&self, events: Vec<CapturedEvent>) -> Result<(), SinkFull>;
+    async fn append(&self, events: Vec<CapturedEvent>) -> Result<(), SinkError>;
 }
 
 /// Explicit bound: no unbounded growth in the ingest path, even in the stub.
@@ -33,24 +37,26 @@ impl MemorySink {
     }
 }
 
+#[async_trait::async_trait]
 impl EventSink for MemorySink {
-    fn append(&self, mut batch: Vec<CapturedEvent>) -> Result<(), SinkFull> {
+    async fn append(&self, mut batch: Vec<CapturedEvent>) -> Result<(), SinkError> {
         let mut events = self.events.lock().unwrap();
         if events.len() + batch.len() > MEMORY_SINK_MAX_EVENTS {
-            return Err(SinkFull);
+            return Err(SinkError::Retryable);
         }
         events.append(&mut batch);
         Ok(())
     }
 }
 
-/// Sink for the running binary until the WAL exists: logs and drops.
+/// Logs and drops. Only for running without persistence.
 pub struct LogSink;
 
+#[async_trait::async_trait]
 impl EventSink for LogSink {
-    fn append(&self, events: Vec<CapturedEvent>) -> Result<(), SinkFull> {
+    async fn append(&self, events: Vec<CapturedEvent>) -> Result<(), SinkError> {
         for e in &events {
-            tracing::info!(event = %e.event, distinct_id = %e.distinct_id, "event (no WAL yet, not persisted)");
+            tracing::info!(event = %e.event, distinct_id = %e.distinct_id, "event (log sink, not persisted)");
         }
         Ok(())
     }

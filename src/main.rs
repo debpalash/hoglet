@@ -14,12 +14,25 @@ async fn main() {
         .parse()
         .expect("HOGLET_ADDR must be a valid socket address like 0.0.0.0:8000");
 
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("HOGLET_DATA").unwrap_or_else(|_| "hoglet-data".into()),
+    );
+    let (sink, _wal_runtime, recovered) = hoglet::wal::open_sink(data_dir.join("wal"))
+        .expect("cannot open WAL");
+    if !recovered.events.is_empty() {
+        tracing::info!(
+            count = recovered.events.len(),
+            truncated_tail = recovered.truncated,
+            "recovered events from WAL (flush to Parquet pending)"
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
     tracing::info!("hoglet listening on {addr}");
 
-    axum::serve(listener, hoglet::app())
+    axum::serve(listener, hoglet::app_with_sink(sink))
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
         })

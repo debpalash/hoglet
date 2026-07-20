@@ -18,7 +18,7 @@ pub const MAX_DISTINCT_ID_CHARS: usize = 200;
 /// Events stamped further than this into the future are clamped to now.
 const MAX_FUTURE_HOURS: i64 = 23;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CapturedEvent {
     pub uuid: Uuid,
     pub event: String,

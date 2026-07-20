@@ -92,9 +92,16 @@ async fn capture(
     };
 
     // Empty after filtering is still success — never make clients retry.
-    if !batch.events.is_empty() && sink.append(batch.events).is_err() {
-        // Sink failure is the one retryable condition.
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    if !batch.events.is_empty() {
+        match sink.append(batch.events).await {
+            Ok(()) => {}
+            Err(crate::sink::SinkError::Retryable) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(crate::sink::SinkError::Fatal) => {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
     }
 
     if beacon {

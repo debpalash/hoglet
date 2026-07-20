@@ -8,6 +8,7 @@ pub mod capture;
 pub mod routes;
 pub mod sink;
 pub mod token;
+pub mod wal;
 
 use std::sync::Arc;
 

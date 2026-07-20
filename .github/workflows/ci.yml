@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly against SDK `latest` — upstream SDK changes break this job,
+    # not users (CLAUDE.md compatibility rules).
+    - cron: "17 3 * * *"
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all
+      - run: cargo clippy -- -D warnings
+
+  sdk-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: cargo build
+      - name: posthog-node latest vs hoglet
+        working-directory: contract-tests
+        run: |
+          npm install --no-audit --no-fund
+          npm run test:node
+      - name: posthog-js latest in Chromium vs hoglet
+        working-directory: contract-tests
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:browser
+
+  forbidden-deps:
+    # Claim 3's dependency assertion: the deployment must never grow a
+    # forbidden service.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no forbidden services
+        run: |
+          ! grep -riE "kafka|clickhouse|redis|zookeeper" Cargo.toml src/

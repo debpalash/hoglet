@@ -1,0 +1,17 @@
+{
+  "name": "hoglet-contract-tests",
+  "private": true,
+  "description": "Real PostHog SDKs against a real Hoglet. SDK versions are NOT pinned — the claim is about their latest (claims.md claim 1).",
+  "type": "module",
+  "scripts": {
+    "test:node": "node node-sdk.test.mjs",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "posthog-node": "*"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0",
+    "posthog-js": "*"
+  }
+}

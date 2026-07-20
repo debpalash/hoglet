@@ -1,0 +1,3 @@
+[submodule "context/harness-engineering"]
+	path = context/harness-engineering
+	url = https://github.com/lopopolo/harness-engineering.git

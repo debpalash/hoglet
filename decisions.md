@@ -67,6 +67,13 @@ Stack: Rust (tokio+axum), hand-rolled WAL, Parquet+DuckDB (events), SQLite (OLTP
 - **Scope ladder:** now = client+server events, identity, flags (AI events captured free via compat). Later = error tracking (exceptions are events), AI analytics dashboard, MCP server over the query API. Never = traces/logs/metrics including LLM trace waterfalls — store trace_id, link out.
 - **One binary, two lanes.** Ingest+WAL get reserved capacity and bounded queues; DuckDB queries run on a capped blocking pool with a memory limit. Ingest always wins under contention.
 
+## Launch decisions (boss, 2026-07-21)
+
+- **License: AGPL-3.0**, sole copyright holder, cloud/commercial option open later.
+- **Build private, launch big.** No public repo until milestone one + demo + measured numbers. One shot at Show HN.
+- **Name: Hoglet** (locked). Tagline: "PostHog-compatible product analytics. One binary. One $5 server."
+- **Community: Discord**, set up launch week, not before.
+
 ## Standing build method
 
 Oracle + property-based testing + shadow mode, per hard component (proven by PostHog's own parser rewrite):

@@ -26,3 +26,6 @@
 # Frontend deps (dist is committed so cargo build needs no Node)
 web/node_modules/
 web/*.tsbuildinfo
+
+# Local-only study material — never committed
+/reference/

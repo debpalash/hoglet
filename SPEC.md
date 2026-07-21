@@ -73,9 +73,9 @@ One process. Two lanes that never starve each other (`decisions.md`
 
 - **Ingest lane** — hot, must never lose data. Reserved worker budget, bounded
   queues. Wins under contention.
-- **Query lane** ○ — heavy CPU, bursty. Runs on a separate blocking-thread pool
-  with a hard concurrency cap; DuckDB runs under a `memory_limit` with spill-to-
-  disk so a funnel query can never OOM the process the ingest lane lives in.
+- **Query lane** ◐ — heavy CPU, bursty. DuckDB over Parquet, built. Still to
+  add: a hard concurrency cap and a DuckDB `memory_limit` with spill-to-disk so
+  a funnel query can never OOM the process the ingest lane lives in.
 
 ```
 SDK ─HTTP─▶ capture ─▶ WAL (fsync) ─ack▶ 2xx
@@ -102,13 +102,15 @@ SDK ─HTTP─▶ capture ─▶ WAL (fsync) ─ack▶ 2xx
 6. **Flush.** `flush.rs` — every 5s: seal WAL segment → write Parquet →
    delete segment → compact. Parquet durable *before* segment delete.
 
-## Data flow — query ○ M2
+## Data flow — query ◐
 
 DuckDB opens Parquet segments **read-only** as a query engine (never a live
-`.duckdb` file — `stack.md`). Funnels: CTE-chain → `LEAD IGNORE NULLS` →
-custom Rust operator. Dashboard: React + TS embedded via `rust-embed`,
-`ts-rs` across the seam. Numbers must reconcile against the raw event log —
-correctness is checked, not assumed (query-semantics oracle, `decisions.md`).
+`.duckdb` file — `stack.md`), uuid-deduped so counts are honest. Built:
+stats, trend, top-events, funnel (CTE-chain, order-respecting), recent. The
+dashboard (`dashboard/index.html`, embedded via `include_str!`) polls the
+`/api/*` endpoints. Still ○: `LEAD IGNORE NULLS` / custom Rust funnel operator
+for scale, retention/cohort views, a real React build via `rust-embed`+`ts-rs`,
+and the query-semantics oracle (`decisions.md`).
 
 ## Data model
 
@@ -213,14 +215,13 @@ not supported and must fail loudly, not corrupt.
 
 ## Security and tenancy ◐
 
-- **Token is currently an opaque namespace.** `token.rs` validates *shape*, not
-  authenticity — any well-formed token is accepted. This is fine for a single-
-  project hobby install; a **project/token registry** (real projects, key
-  issuance, revocation) is M2 and is where authenticity will live. Named here so
-  no one assumes it exists.
+- **Token authenticity** ◐ — `registry/` gives projects real identity. Open mode
+  (zero projects) accepts any shape-valid token so a hobby install needs no
+  setup; creating a project flips to closed mode where only registered tokens
+  are accepted. Still ○: a project-management API/UI to create and revoke them.
 - **Untrusted input.** The capture edge takes internet input: bounded bodies,
-  bomb-resistant decode, no unbounded allocation. Rate limiting ○ (per-token,
-  returns 429 on the retry-safe contract) is M2.
+  bomb-resistant decode, no unbounded allocation. Per-token rate limiting ✅
+  (fixed-window, 429 on the retry-safe contract, `HOGLET_MAX_EVENTS_PER_SEC`).
 - **PII.** Event properties may contain personal data. We store what the SDK
   sends; deletion/export for GDPR ○ is a compaction-time operation, M2.
 - **Network.** Binds where configured; TLS is expected to terminate at a
@@ -230,13 +231,13 @@ not supported and must fail loudly, not corrupt.
 
 A single operator runs this without a platform team.
 
-- **Health/readiness** ○ — `/health` (liveness) and a readiness gate that is not
-  ready until WAL recovery and stores are open. Fixes the cold-start
-  "connection refused" window. **Build early — it's a known gap.**
+- **Health/readiness** ✅ — `/health` (liveness) and `/ready` (gated until stores
+  are open and the flusher is running). Closes the cold-start window.
 - **Backup/restore** — the data dir is the whole state (WAL + Parquet +
-  `identity.db`). A file-level copy of a quiesced dir is a valid backup; document
-  the quiesce.
-- **Retention/TTL** ○ — operator-set max age; enforced at compaction.
+  `identity.db` + `projects.db`). A file-level copy of a quiesced dir is a valid
+  backup; document the quiesce.
+- **Retention/TTL** ✅ — operator-set max age (`HOGLET_RETENTION_DAYS`); expired
+  Parquet files dropped hourly, whole-file only (never drops a live event).
 - **Upgrade** — drop-in binary swap; format evolution guarantees the old data
   dir opens. Downgrade unsupported.
 - **Self-observability** — structured logs now; a minimal internal metrics
@@ -275,9 +276,11 @@ the boundary where someone experiences them (`claims.md`). Current status:
 - **M1 — a real app works ✅.** Config, capture+decompression, WAL,
   Parquet+compactor, flags shapes, identity, SDK contract harness. 72 tests +
   SIGKILL + node contract test green.
-- **M2 — usable product ○.** Query layer (trends/funnels/retention over DuckDB),
-  React dashboard embedded in the binary, project/token registry, readiness +
-  rate limiting, retention, the claim-3 load test.
+- **M2 — usable product ◐.** Built: query layer (stats/trend/top/funnel over
+  DuckDB), embedded live dashboard, project/token registry, readiness + per-token
+  rate limiting, retention, format versioning. Remaining ○: real flag evaluation
+  (rollout %/cohorts), query-lane memory cap, the claim-3 load test, a real React
+  build.
 - **M3 — launch ○.** One-curl install, demo, measured benchmark, Show HN.
 
 Scope ladder (`CLAUDE.md`): now = client+server events, identity, flags; later =

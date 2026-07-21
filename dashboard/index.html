@@ -6,46 +6,71 @@
 <title>Hoglet</title>
 <style>
   :root {
-    --bg: #0b0d10; --panel: #14181d; --line: #232a31;
+    --bg: #0b0d10; --panel: #14181d; --panel2: #1a1f26; --line: #232a31;
     --fg: #e6edf3; --dim: #8b98a5; --accent: #ffb454; --good: #3fb950;
+    --blue: #58a6ff; --purple: #bc8cff;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); }
   header {
     display: flex; align-items: center; gap: 12px;
-    padding: 16px 24px; border-bottom: 1px solid var(--line);
+    padding: 14px 24px; border-bottom: 1px solid var(--line);
   }
-  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
   header .hog { font-size: 22px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
   header .tag { color: var(--dim); font-size: 12px; }
   header input {
     margin-left: auto; background: var(--panel); border: 1px solid var(--line);
-    color: var(--fg); padding: 6px 10px; border-radius: 6px; font: inherit;
+    color: var(--fg); padding: 6px 10px; border-radius: 6px; font: inherit; width: 200px;
   }
-  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
-  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-  .card {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 10px; padding: 18px;
+  nav { display: flex; gap: 4px; padding: 0 24px; border-bottom: 1px solid var(--line); background: var(--bg); }
+  nav button {
+    background: none; border: none; color: var(--dim); font: inherit; font-size: 13px;
+    padding: 12px 16px; cursor: pointer; border-bottom: 2px solid transparent;
   }
-  .card .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .05em; }
-  .card .value { font-size: 34px; font-weight: 700; margin-top: 6px; }
-  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
-  @media (max-width: 800px) { .cards, .grid2 { grid-template-columns: 1fr; } }
-  section.panel {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 10px; padding: 18px; min-height: 200px;
-  }
-  section.panel h2 { font-size: 13px; color: var(--dim); margin: 0 0 12px; text-transform: uppercase; letter-spacing: .05em; }
-  .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  nav button:hover { color: var(--fg); }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .value { font-size: 30px; font-weight: 700; margin-top: 6px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cards { grid-template-columns: repeat(2,1fr); } .grid2 { grid-template-columns: 1fr; } }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  section.panel h2 { font-size: 12px; color: var(--dim); margin: 0 0 14px; text-transform: uppercase; letter-spacing: .05em; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
   .row:last-child { border-bottom: none; }
   .row .n { color: var(--accent); }
+  .bar-wrap { flex: 1; margin: 0 12px; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar { height: 100%; background: var(--accent); border-radius: 4px; }
   .ev { font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
   .ev .name { color: var(--good); }
   .ev .did { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ev .ts { color: var(--dim); margin-left: auto; white-space: nowrap; }
-  .empty { color: var(--dim); font-size: 13px; }
+  .empty { color: var(--dim); font-size: 13px; padding: 8px 0; }
+  .controls { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .controls input, .controls select, .controls button {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+    padding: 6px 10px; border-radius: 6px; font: inherit; font-size: 13px;
+  }
+  .controls button { cursor: pointer; color: var(--accent); }
+  .funnel-step { margin-bottom: 12px; }
+  .funnel-step .top { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+  .funnel-step .conv { color: var(--good); }
+  .funnel-step .drop { color: var(--dim); font-size: 11px; }
+  .fbar { height: 30px; background: linear-gradient(90deg, var(--blue), var(--purple)); border-radius: 6px; min-width: 2px; display: flex; align-items: center; padding-left: 10px; font-size: 13px; font-weight: 600; }
+  .flag { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .flag:last-child { border-bottom: none; }
+  .flag .key { font-size: 14px; flex: 1; }
+  .flag .pill { font-size: 11px; padding: 3px 8px; border-radius: 10px; }
+  .flag .on { background: rgba(63,185,80,.15); color: var(--good); }
+  .flag .off { background: rgba(139,152,165,.15); color: var(--dim); }
+  .flag .rollout { color: var(--accent); font-size: 13px; width: 48px; text-align: right; }
+  svg text { fill: var(--dim); font-size: 10px; }
   footer { color: var(--dim); font-size: 11px; text-align: center; padding: 24px; }
 </style>
 </head>
@@ -56,56 +81,146 @@
   <span class="tag">PostHog-compatible · one binary</span>
   <input id="token" value="phc_demo" spellcheck="false" />
 </header>
+<nav>
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="funnels">Funnels</button>
+  <button data-tab="trends">Trends</button>
+  <button data-tab="flags">Flags</button>
+</nav>
 <main>
-  <div class="cards">
-    <div class="card"><div class="label">Total events</div><div class="value" id="total">–</div></div>
-    <div class="card"><div class="label">Unique persons</div><div class="value" id="persons">–</div></div>
-    <div class="card"><div class="label">Last 24h</div><div class="value" id="last24">–</div></div>
+  <!-- OVERVIEW -->
+  <div class="tab active" id="tab-overview">
+    <div class="cards">
+      <div class="card"><div class="label">Total events</div><div class="value" id="total">–</div></div>
+      <div class="card"><div class="label">Unique persons</div><div class="value" id="persons">–</div></div>
+      <div class="card"><div class="label">Last 24h</div><div class="value" id="last24">–</div></div>
+      <div class="card"><div class="label">Events / person</div><div class="value" id="epp">–</div></div>
+    </div>
+    <div class="grid2">
+      <section class="panel"><h2>Top events</h2><div id="top"><div class="empty">No events yet.</div></div></section>
+      <section class="panel"><h2>Live stream</h2><div id="live"><div class="empty">Waiting for events…</div></div></section>
+    </div>
   </div>
-  <div class="grid2">
+
+  <!-- FUNNELS -->
+  <div class="tab" id="tab-funnels">
     <section class="panel">
-      <h2>Top events</h2>
-      <div id="top"><div class="empty">No events yet.</div></div>
+      <h2>Funnel builder</h2>
+      <div class="controls">
+        <input id="funnel-steps" style="flex:1;min-width:280px" value="signup, activate, purchase" placeholder="comma-separated event names" />
+        <button onclick="runFunnel()">Run funnel</button>
+      </div>
+      <div id="funnel"><div class="empty">Enter steps and run.</div></div>
     </section>
+  </div>
+
+  <!-- TRENDS -->
+  <div class="tab" id="tab-trends">
     <section class="panel">
-      <h2>Live stream</h2>
-      <div id="live"><div class="empty">Waiting for events…</div></div>
+      <h2>Trend</h2>
+      <div class="controls">
+        <input id="trend-event" value="$pageview" placeholder="event name" />
+        <select id="trend-days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select>
+        <button onclick="runTrend()">Plot</button>
+      </div>
+      <div id="trend"><div class="empty">Pick an event and plot.</div></div>
     </section>
+  </div>
+
+  <!-- FLAGS -->
+  <div class="tab" id="tab-flags">
+    <section class="panel"><h2>Feature flags</h2><div id="flags"><div class="empty">No flags defined.</div></div></section>
   </div>
 </main>
 <footer>Hoglet · numbers you can trust</footer>
 <script>
 const $ = (id) => document.getElementById(id);
 const token = () => encodeURIComponent($("token").value.trim() || "phc_demo");
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function j(url, opts) { try { const r = await fetch(url, opts); if (!r.ok) return null; return await r.json(); } catch { return null; } }
 
-async function j(url) {
-  try { const r = await fetch(url); if (!r.ok) return null; return await r.json(); }
-  catch { return null; }
-}
+// Tabs
+let current = "overview";
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
+  current = b.dataset.tab;
+  document.querySelectorAll("nav button").forEach(x => x.classList.toggle("active", x === b));
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + current));
+  refresh();
+});
 
-async function refresh() {
+async function refreshOverview() {
   const s = await j(`/api/stats?token=${token()}`);
   if (s) {
     $("total").textContent = s.total_events.toLocaleString();
     $("persons").textContent = s.unique_persons.toLocaleString();
     $("last24").textContent = s.events_24h.toLocaleString();
+    $("epp").textContent = s.unique_persons ? (s.total_events / s.unique_persons).toFixed(1) : "–";
   }
   const top = await j(`/api/top_events?token=${token()}&limit=8`);
   if (top) {
-    $("top").innerHTML = top.length
-      ? top.map(t => `<div class="row"><span>${esc(t.event)}</span><span class="n">${t.count.toLocaleString()}</span></div>`).join("")
-      : `<div class="empty">No events yet.</div>`;
+    const max = Math.max(1, ...top.map(t => t.count));
+    $("top").innerHTML = top.length ? top.map(t =>
+      `<div class="row"><span>${esc(t.event)}</span><div class="bar-wrap"><div class="bar" style="width:${t.count/max*100}%"></div></div><span class="n">${t.count.toLocaleString()}</span></div>`
+    ).join("") : `<div class="empty">No events yet.</div>`;
   }
   const live = await j(`/api/recent?token=${token()}&limit=25`);
   if (live) {
-    $("live").innerHTML = live.length
-      ? live.map(e => `<div class="ev"><span class="name">${esc(e.event)}</span><span class="did">${esc(e.distinct_id)}</span><span class="ts">${esc(e.timestamp.slice(11,19))}</span></div>`).join("")
-      : `<div class="empty">Waiting for events…</div>`;
+    $("live").innerHTML = live.length ? live.map(e =>
+      `<div class="ev"><span class="name">${esc(e.event)}</span><span class="did">${esc(e.distinct_id)}</span><span class="ts">${esc(e.timestamp.slice(11,19))}</span></div>`
+    ).join("") : `<div class="empty">Waiting for events…</div>`;
   }
 }
-function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+async function runFunnel() {
+  const steps = $("funnel-steps").value.split(",").map(s => s.trim()).filter(Boolean);
+  if (!steps.length) return;
+  const data = await j(`/api/funnel`, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify({ token: $("token").value.trim(), steps }) });
+  if (!data) { $("funnel").innerHTML = `<div class="empty">Query failed.</div>`; return; }
+  const first = data[0]?.reached || 0;
+  $("funnel").innerHTML = data.map((s, i) => {
+    const pctOfFirst = first ? (s.reached / first * 100) : 0;
+    const prev = i ? data[i-1].reached : s.reached;
+    const drop = prev ? (100 - s.reached / prev * 100) : 0;
+    return `<div class="funnel-step">
+      <div class="top"><span>${i+1}. ${esc(s.event)}</span><span><span class="conv">${pctOfFirst.toFixed(0)}%</span> ${i?`<span class="drop">(−${drop.toFixed(0)}% from prev)</span>`:""}</span></div>
+      <div class="fbar" style="width:${Math.max(pctOfFirst,2)}%">${s.reached.toLocaleString()}</div>
+    </div>`;
+  }).join("");
+}
+
+async function runTrend() {
+  const ev = $("trend-event").value.trim();
+  const days = $("trend-days").value;
+  const data = await j(`/api/trend?token=${token()}&event=${encodeURIComponent(ev)}&days=${days}`);
+  if (!data || !data.length) { $("trend").innerHTML = `<div class="empty">No data for "${esc(ev)}".</div>`; return; }
+  const W = 900, H = 240, pad = 30;
+  const max = Math.max(1, ...data.map(d => d.count));
+  const bw = (W - pad*2) / data.length;
+  const bars = data.map((d, i) => {
+    const h = (d.count / max) * (H - pad*2);
+    const x = pad + i*bw, y = H - pad - h;
+    return `<rect x="${x+2}" y="${y}" width="${bw-4}" height="${h}" fill="var(--accent)" rx="2"><title>${esc(d.day)}: ${d.count}</title></rect>` +
+           (data.length <= 31 ? `<text x="${x+bw/2}" y="${H-pad+14}" text-anchor="middle">${esc(d.day.slice(5))}</text>` : "");
+  }).join("");
+  $("trend").innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%"><text x="${pad}" y="16">${esc(ev)} — max ${max}/day</text>${bars}</svg>`;
+}
+
+async function refreshFlags() {
+  const data = await j(`/api/flags?token=${token()}`);
+  if (!data) return;
+  $("flags").innerHTML = data.length ? data.map(f =>
+    `<div class="flag"><span class="key">${esc(f.key)}</span>
+      <span class="pill ${f.active?'on':'off'}">${f.active?'active':'inactive'}</span>
+      <span class="rollout">${f.rollout_percentage}%</span></div>`
+  ).join("") : `<div class="empty">No flags defined. Create one via the admin API.</div>`;
+}
+
+function refresh() {
+  if (current === "overview") refreshOverview();
+  else if (current === "flags") refreshFlags();
+}
 refresh();
-setInterval(refresh, 2000);
+setInterval(() => { if (current === "overview") refreshOverview(); }, 2000);
 </script>
 </body>
 </html>

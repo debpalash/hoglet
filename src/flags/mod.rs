@@ -23,6 +23,13 @@ pub struct EvaluatedFlag {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct FlagDef {
+    pub key: String,
+    pub active: bool,
+    pub rollout_percentage: f64,
+}
+
 pub struct FlagStore {
     conn: Mutex<Connection>,
 }
@@ -58,6 +65,24 @@ impl FlagStore {
             params![token, key, active as i64, rollout],
         )?;
         Ok(())
+    }
+
+    /// List all flag definitions for a token (dashboard view).
+    pub fn list(&self, token: &str) -> Vec<FlagDef> {
+        let conn = self.conn.lock().unwrap();
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT key, active, rollout_percentage FROM feature_flags WHERE token=?1 ORDER BY key",
+        ) else {
+            return vec![];
+        };
+        let rows = stmt.query_map(params![token], |r| {
+            Ok(FlagDef {
+                key: r.get(0)?,
+                active: r.get::<_, i64>(1)? != 0,
+                rollout_percentage: r.get(2)?,
+            })
+        });
+        rows.map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
     /// Evaluate every active flag for this token against `distinct_id`.

@@ -12,7 +12,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use serde_json::{Map, Value, json};
 
@@ -36,7 +36,21 @@ pub fn router(store: Arc<FlagStore>) -> Router {
         .route("/flags/", post(flags))
         .route("/decide", post(flags))
         .route("/decide/", post(flags))
+        // Dashboard: list flag definitions (read-only).
+        .route("/api/flags", get(list_flags))
         .with_state(FlagsState { store })
+}
+
+#[derive(serde::Deserialize)]
+struct ListQuery {
+    token: String,
+}
+
+async fn list_flags(
+    State(state): State<FlagsState>,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    Json(state.store.list(&q.token)).into_response()
 }
 
 async fn flags(

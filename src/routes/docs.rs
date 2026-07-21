@@ -138,14 +138,11 @@ pub fn spec() -> Value {
                 "post": {
                     "tags": ["Capture"],
                     "summary": "Capture — /e",
-                    "description": "One aliased handler also serving /capture, /track, /engage, \
-                        /i/v0/e. Accepts a bare event array or a single event. Body may be gzip \
-                        (magic-byte sniffed), base64, form-encoded (data=…), or raw JSON. \
-                        Returns 200 {status:1}; 204 when ?beacon=1; 4xx never-retry; 503 retryable.",
+                    "description": "Ingest events from browser SDKs. The same handler is served at `/capture`, `/track`, `/engage`, and `/i/v0/e`.\n\nThe body may be a bare JSON array of events or a single event object. Accepted encodings: gzip (detected by magic bytes), base64, form-encoded (`data=`), or plain JSON — the `compression` hint is never trusted.\n\nResponses follow the SDK retry contract: `200` on success, `204` when `beacon=1`, `4xx` for requests the client must not retry, `503` only for retryable failures.",
                     "parameters": [
-                        { "name": "beacon", "in": "query", "schema": {"type":"string"}, "description": "When 1, respond 204." },
-                        { "name": "compression", "in": "query", "schema": {"type":"string"}, "description": "Hint only; gzip is content-sniffed." },
-                        { "name": "_", "in": "query", "schema": {"type":"string"}, "description": "sent_at (ms) / cache-buster." }
+                        { "name": "beacon", "in": "query", "schema": {"type":"string"}, "description": "Set to `1` by `sendBeacon` on page unload; the response is then `204 No Content`." },
+                        { "name": "compression", "in": "query", "schema": {"type":"string"}, "description": "Client hint only — gzip is detected by content sniffing regardless." },
+                        { "name": "_", "in": "query", "schema": {"type":"string"}, "description": "Send timestamp in milliseconds; doubles as a cache buster." }
                     ],
                     "requestBody": {
                         "content": { "application/json": {
@@ -167,7 +164,7 @@ pub fn spec() -> Value {
                 "post": {
                     "tags": ["Capture"],
                     "summary": "Batch capture — /batch",
-                    "description": "Server-SDK batch ingestion. Body is {api_key, batch:[events], sent_at?}; the batch-level api_key wins over per-event tokens. sent_at corrects client clock skew. Same compression handling and response contract as /e.",
+                    "description": "Ingest event batches from server SDKs.\n\nThe batch-level `api_key` authenticates every event in the batch and takes precedence over per-event tokens. When `sent_at` is present, Hoglet uses it to correct client clock skew before storing timestamps.\n\nCompression handling and the response contract are identical to `/e`.",
                     "requestBody": { "content": { "application/json": {
                         "schema": { "$ref": "#/components/schemas/Batch" },
                         "example": { "api_key": "phc_demo", "batch": [
@@ -182,9 +179,7 @@ pub fn spec() -> Value {
                 "get": {
                     "tags": ["Config"],
                     "summary": "SDK config",
-                    "description": "The first request posthog-js makes. Advertises supported \
-                        compression and which features are enabled; unimplemented features are \
-                        returned as false so the SDK never calls them.",
+                    "description": "The bootstrap configuration `posthog-js` fetches before anything else.\n\nThe response advertises supported compression and which product features are enabled. Features Hoglet does not implement are declared off — `sessionRecording`, `surveys`, `heatmaps` — so the SDK never calls endpoints that do not exist.",
                     "parameters": [{ "name": "token", "in": "path", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "Config JSON" }, "401": { "description": "Invalid token" } }
                 }
@@ -193,10 +188,7 @@ pub fn spec() -> Value {
                 "post": {
                     "tags": ["Flags"],
                     "summary": "Evaluate flags",
-                    "description": "Also served at /decide. ?v= selects the response shape \
-                        (v1 = enabled-key array, v2 = {key: bool|variant} map, default = FlagDetails). \
-                        Bucketed per distinct_id with PostHog's SHA1 hash. Conditions match against \
-                        person_properties in the body.",
+                    "description": "Evaluate every active feature flag for a user. Also served at `/decide` for older SDKs.\n\nThe `v` query parameter selects the response shape:\n- `v=1` — array of enabled flag keys\n- `v=2` — map of flag key to `true`/`false` or a variant name\n- default — detailed per-flag objects with evaluation metadata\n\nRollouts bucket deterministically per `distinct_id`: results are stable across calls, and raising a rollout only ever adds users. Property conditions are matched against `person_properties` from the request body.",
                     "parameters": [{ "name": "v", "in": "query", "schema": {"type":"string","enum":["1","2"]} }],
                     "requestBody": { "content": { "application/json": {
                         "example": { "token": "phc_demo", "distinct_id": "u1", "person_properties": { "plan": "pro" } }
@@ -207,7 +199,7 @@ pub fn spec() -> Value {
             "/api/stats": {
                 "get": {
                     "tags": ["Query"], "summary": "Stats",
-                    "description": "Project totals: event count, unique persons, and events in the last 24h. Counts are uuid-deduplicated, so replayed segments never inflate numbers.",
+                    "description": "Headline numbers for a project: total events, unique persons, and events in the last 24 hours.\n\nCounts are deduplicated by event `uuid`, so a replayed write-ahead-log segment can never inflate them.",
                     "parameters": [{ "name": "token", "in": "query", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "OK", "content": {"application/json": {"schema": {"$ref":"#/components/schemas/Stats"}}}}}
                 }
@@ -215,7 +207,7 @@ pub fn spec() -> Value {
             "/api/top_events": {
                 "get": {
                     "tags": ["Query"], "summary": "Top events",
-                    "description": "Event names ranked by count, highest first. Backs the dashboard's Top Events panel.",
+                    "description": "Event names ranked by occurrence count, highest first.\n\nPowers the *Top events* panel on the dashboard.",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "limit", "in": "query", "schema": {"type":"integer","default":20} }
@@ -226,7 +218,7 @@ pub fn spec() -> Value {
             "/api/trend": {
                 "get": {
                     "tags": ["Query"], "summary": "Trend",
-                    "description": "Daily counts of a single event over the last N days (default 30, max 365). Days with zero events are omitted.",
+                    "description": "Daily occurrence counts for one event over the last `days` days (default 30, maximum 365).\n\nDays with no occurrences are omitted from the result.",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "event", "in": "query", "required": true, "schema": {"type":"string"} },
@@ -238,7 +230,7 @@ pub fn spec() -> Value {
             "/api/funnel": {
                 "post": {
                     "tags": ["Query"], "summary": "Funnel",
-                    "description": "Ordered conversion funnel: for steps [A,B,C], how many distinct persons did A, then B at-or-after A, then C at-or-after B. Monotonically non-increasing. Max 12 steps.",
+                    "description": "Ordered conversion funnel.\n\nFor steps `[A, B, C]`: how many distinct persons did `A`, then `B` at or after their `A`, then `C` at or after their `B`. Step counts are monotonically non-increasing by construction. Up to 12 steps.",
                     "requestBody": { "content": { "application/json": {
                         "example": { "token": "phc_demo", "steps": ["signup", "activate", "purchase"] }
                     }}},
@@ -248,7 +240,7 @@ pub fn spec() -> Value {
             "/api/recent": {
                 "get": {
                     "tags": ["Query"], "summary": "Recent events",
-                    "description": "Newest events first — the dashboard's live stream. Max 200 per request.",
+                    "description": "The newest events for a project, most recent first — the dashboard's live stream.\n\nCapped at 200 events per request.",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "limit", "in": "query", "schema": {"type":"integer","default":20} }
@@ -259,7 +251,7 @@ pub fn spec() -> Value {
             "/api/flags": {
                 "get": {
                     "tags": ["Query"], "summary": "Flags list",
-                    "description": "All flag definitions for a project, including rollout percentage and variants. Read-only; definitions are managed via the Admin API.",
+                    "description": "Every flag definition for a project: key, active state, rollout percentage, and variants.\n\nRead-only — definitions are created and updated through the Admin API.",
                     "parameters": [{ "name": "token", "in": "query", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "OK", "content": {"application/json": {"schema": {"type":"array","items":{"$ref":"#/components/schemas/FlagDef"}}}}}}
                 }
@@ -267,7 +259,7 @@ pub fn spec() -> Value {
             "/api/admin/projects": {
                 "post": {
                     "tags": ["Admin"], "summary": "Create project",
-                    "description": "Registers a project token. With zero projects Hoglet runs in open mode (any well-formed token ingests); creating the first project flips to closed mode where only registered tokens are accepted.",
+                    "description": "Register a project and its ingest token.\n\nWith no projects registered, Hoglet runs in **open mode**: any well-formed token is accepted, so a single-tenant install needs no setup. Creating the first project switches to **closed mode**, where only registered tokens may ingest.",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": { "token": "phc_acme", "name": "Acme" } }}},
                     "responses": { "201": { "description": "Created" }, "401": { "description": "Bad admin token" }, "404": { "description": "Admin API disabled" } }
@@ -276,7 +268,7 @@ pub fn spec() -> Value {
             "/api/admin/flags": {
                 "post": {
                     "tags": ["Admin"], "summary": "Upsert flag",
-                    "description": "Create or update a feature flag: rollout percentage, active state, optional weighted variants (multivariate), and optional property conditions matched against person_properties at evaluation.",
+                    "description": "Create a feature flag, or update it in place.\n\nA flag has an active state, a rollout percentage, optional weighted **variants** for multivariate tests, and optional **conditions** — property filters matched against `person_properties` at evaluation time.",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": {
                         "token": "phc_demo", "key": "new-checkout", "rollout_percentage": 60,
@@ -289,18 +281,18 @@ pub fn spec() -> Value {
             "/api/admin/forget": {
                 "post": {
                     "tags": ["Admin"], "summary": "Erase person (GDPR)",
-                    "description": "Physically removes a person's events from Parquet and their identity.",
+                    "description": "Erase one person, physically and synchronously.\n\nRemoves the person's events from columnar storage and deletes their identity mappings. Built for GDPR right-to-erasure requests: the data is gone when the request returns.",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": { "token": "phc_demo", "distinct_id": "forget-me" } }}},
                     "responses": { "200": { "description": "Erased", "content": {"application/json": {"example": {"events_removed": 3}}}}}
                 }
             },
             "/health": { "get": { "tags": ["Ops"], "summary": "Liveness",
-                    "description": "Process-up check. Always 200 while the server runs; carries no readiness meaning.", "responses": { "200": { "description": "Alive" } } } },
+                    "description": "Liveness probe. Returns `200` for as long as the process is running — it says nothing about readiness to serve traffic.", "responses": { "200": { "description": "Alive" } } } },
             "/ready": { "get": { "tags": ["Ops"], "summary": "Readiness",
-                    "description": "Traffic gate: 200 only after WAL recovery finished and stores are open, else 503. Point load-balancer health checks here.", "responses": { "200": { "description": "Ready" }, "503": { "description": "Not ready" } } } },
+                    "description": "Readiness gate. Returns `200` only once write-ahead-log recovery has finished and every store is open; `503` before that.\n\nPoint load balancers and orchestration health checks here.", "responses": { "200": { "description": "Ready" }, "503": { "description": "Not ready" } } } },
             "/metrics": { "get": { "tags": ["Ops"], "summary": "Metrics",
-                    "description": "Hoglet's own operational counters in Prometheus text format: events captured/acked, rejected requests, sink errors, uptime.", "responses": { "200": { "description": "text/plain exposition" } } } }
+                    "description": "Hoglet's own operational counters in Prometheus text format: events captured and acknowledged, rejected requests, sink errors, and uptime.\n\nOperator telemetry for the Hoglet process itself — not part of the analytics product.", "responses": { "200": { "description": "text/plain exposition" } } } }
         },
         "components": {
             "securitySchemes": {

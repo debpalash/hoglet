@@ -22,6 +22,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::identity::IdentityStore;
+use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::registry::{Decision, Registry};
 use crate::sink::EventSink;
@@ -32,6 +33,7 @@ pub struct CaptureState {
     pub identity: Arc<IdentityStore>,
     pub registry: Arc<Registry>,
     pub limiter: Arc<RateLimiter>,
+    pub metrics: Arc<Metrics>,
 }
 
 /// Body limit for browser-SDK endpoints (/e and friends).
@@ -96,8 +98,12 @@ async fn capture(
 
     let batch = match event::parse_body(&text, sent_at, now) {
         Ok(batch) => batch,
-        Err(event::CaptureError::Malformed(_)) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(event::CaptureError::Malformed(_)) => {
+            state.metrics.inc_rejected();
+            return StatusCode::BAD_REQUEST.into_response();
+        }
         Err(event::CaptureError::Unauthorized(_)) => {
+            state.metrics.inc_rejected();
             return StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -110,6 +116,7 @@ async fn capture(
         if let Some(first) = batch.events.first()
             && state.registry.check(&first.token) == Decision::Reject
         {
+            state.metrics.inc_rejected();
             return StatusCode::UNAUTHORIZED.into_response();
         }
         // Rate limit per token; 429 is retry-safe on the SDK's backoff.
@@ -118,15 +125,20 @@ async fn capture(
                 .limiter
                 .allow(&first.token, batch.events.len() as u32, now.timestamp())
         {
+            state.metrics.inc_rejected();
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
         let events = batch.events;
+        let n = events.len() as u64;
+        state.metrics.inc_captured(n);
         match state.sink.append(events.clone()).await {
-            Ok(()) => {}
+            Ok(()) => state.metrics.inc_acked(n),
             Err(crate::sink::SinkError::Retryable) => {
+                state.metrics.inc_sink_errors();
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             Err(crate::sink::SinkError::Fatal) => {
+                state.metrics.inc_rejected();
                 return StatusCode::BAD_REQUEST.into_response();
             }
         }
@@ -170,6 +182,7 @@ mod tests {
             identity: Arc::new(IdentityStore::in_memory().unwrap()),
             registry: Arc::new(Registry::in_memory().unwrap()),
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
+            metrics: Arc::new(Metrics::default()),
         };
         (router(state), sink)
     }

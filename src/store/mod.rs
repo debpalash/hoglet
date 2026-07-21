@@ -94,6 +94,34 @@ impl EventStore {
         Ok(deleted)
     }
 
+    /// Physically remove every event for `distinct_id` under `token`
+    /// (SPEC.md "PII" / GDPR). Rewrites each Parquet file without the matching
+    /// rows; deletes a file that becomes empty. Synchronous and complete — the
+    /// person's events are gone when this returns. Returns rows removed.
+    pub fn purge_distinct_id(&self, token: &str, distinct_id: &str) -> std::io::Result<usize> {
+        let mut removed = 0;
+        for path in self.list_files()? {
+            let events = parquet::read_file(&path)?;
+            let before = events.len();
+            let kept: Vec<CapturedEvent> = events
+                .into_iter()
+                .filter(|e| !(e.token == token && e.distinct_id == distinct_id))
+                .collect();
+            if kept.len() == before {
+                continue; // nothing to purge in this file
+            }
+            removed += before - kept.len();
+            std::fs::remove_file(&path)?;
+            if !kept.is_empty() {
+                self.write_events(&kept)?;
+            }
+        }
+        if removed > 0 {
+            std::fs::File::open(&self.dir)?.sync_all()?;
+        }
+        Ok(removed)
+    }
+
     /// Merge small Parquet files into one. Returns the number of files
     /// merged (0 = nothing to do).
     pub fn compact(&self) -> std::io::Result<usize> {
@@ -226,6 +254,30 @@ mod tests {
             .map(|e| e.event)
             .collect();
         assert_eq!(remaining, vec!["recent"]);
+    }
+
+    #[test]
+    fn purge_removes_only_that_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().to_path_buf()).unwrap();
+        let mut a = event("keep");
+        a.distinct_id = "keep-me".into();
+        let mut b = event("gdpr");
+        b.distinct_id = "forget-me".into();
+        store.write_events(&[a]).unwrap();
+        store.write_events(&[b.clone(), b]).unwrap();
+
+        let removed = store.purge_distinct_id("phc_t", "forget-me").unwrap();
+        assert_eq!(removed, 2);
+        let survivors: Vec<String> = store
+            .list_files()
+            .unwrap()
+            .iter()
+            .flat_map(|p| parquet::read_file(p).unwrap())
+            .map(|e| e.distinct_id)
+            .collect();
+        assert!(survivors.iter().all(|d| d == "keep-me"));
+        assert_eq!(survivors.len(), 1);
     }
 
     #[test]

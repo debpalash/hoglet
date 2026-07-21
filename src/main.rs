@@ -32,7 +32,7 @@ async fn main() {
     let retention_days = std::env::var("HOGLET_RETENTION_DAYS")
         .ok()
         .and_then(|v| v.parse().ok());
-    hoglet::flush::spawn(wal.clone(), store, retention_days);
+    hoglet::flush::spawn(wal.clone(), store.clone(), retention_days);
     let identity = std::sync::Arc::new(
         hoglet::identity::IdentityStore::open(&data_dir.join("identity.db"))
             .expect("cannot open identity store"),
@@ -48,11 +48,13 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(hoglet::ratelimit::DEFAULT_MAX_PER_SEC);
+    let now_epoch = chrono::Utc::now().timestamp().max(0) as u64;
     let state = hoglet::capture::CaptureState {
         sink: std::sync::Arc::new(hoglet::wal::WalSink(wal)),
         identity,
         registry,
         limiter: std::sync::Arc::new(hoglet::ratelimit::RateLimiter::new(max_per_sec)),
+        metrics: std::sync::Arc::new(hoglet::metrics::Metrics::new(now_epoch)),
     };
     let engine = std::sync::Arc::new(hoglet::query::QueryEngine::new(data_dir.join("events")));
     let flag_store = std::sync::Arc::new(
@@ -78,7 +80,7 @@ async fn main() {
         .map(std::sync::Arc::new);
     axum::serve(
         listener,
-        hoglet::app_with_state(state, readiness, engine, flag_store, admin_token),
+        hoglet::app_with_state(state, readiness, engine, flag_store, store, admin_token),
     )
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();

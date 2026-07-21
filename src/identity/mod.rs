@@ -122,6 +122,28 @@ impl IdentityStore {
         Ok(())
     }
 
+    /// Forget a distinct_id: remove its person and all that person's
+    /// distinct_id mappings (SPEC.md "PII" / GDPR). Returns true if a person
+    /// was removed.
+    pub fn forget(&self, token: &str, distinct_id: &str) -> Result<bool, IdentityError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let person: Option<i64> = tx
+            .query_row(
+                "SELECT person_id FROM distinct_ids WHERE token=?1 AND distinct_id=?2",
+                params![token, distinct_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(person) = person else {
+            return Ok(false);
+        };
+        tx.execute("DELETE FROM distinct_ids WHERE person_id=?1", params![person])?;
+        tx.execute("DELETE FROM persons WHERE id=?1", params![person])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Person id for a distinct_id, if any (tests + future query layer).
     pub fn person_of(&self, token: &str, distinct_id: &str) -> Option<i64> {
         let conn = self.conn.lock().unwrap();

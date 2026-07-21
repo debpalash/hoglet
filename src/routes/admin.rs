@@ -19,12 +19,16 @@ use axum::{
 use serde::Deserialize;
 
 use crate::flags::FlagStore;
+use crate::identity::IdentityStore;
 use crate::registry::Registry;
+use crate::store::EventStore;
 
 #[derive(Clone)]
 pub struct AdminState {
     pub registry: Arc<Registry>,
     pub flags: Arc<FlagStore>,
+    pub identity: Arc<IdentityStore>,
+    pub store: Arc<EventStore>,
     /// None ⇒ admin API disabled.
     pub admin_token: Option<Arc<String>>,
 }
@@ -33,7 +37,37 @@ pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/api/admin/projects", post(create_project))
         .route("/api/admin/flags", post(upsert_flag))
+        .route("/api/admin/forget", post(forget_person))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+struct ForgetPerson {
+    token: String,
+    distinct_id: String,
+}
+
+/// GDPR erasure: physically remove a person's events and identity.
+async fn forget_person(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<ForgetPerson>,
+) -> Response {
+    if let Some(rejection) = authorize(&state, &headers) {
+        return rejection;
+    }
+    let identity = state.identity.clone();
+    let store = state.store.clone();
+    let (token, did) = (body.token.clone(), body.distinct_id.clone());
+    let result = tokio::task::spawn_blocking(move || {
+        identity.forget(&token, &did).ok();
+        store.purge_distinct_id(&token, &did)
+    })
+    .await;
+    match result {
+        Ok(Ok(removed)) => Json(serde_json::json!({ "events_removed": removed })).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// Returns Some(response) when the request must be rejected, None when
@@ -129,9 +163,12 @@ mod tests {
     use tower::ServiceExt;
 
     fn state(admin_token: Option<&str>) -> AdminState {
+        let dir = std::env::temp_dir().join(format!("hoglet-admin-test-{}", std::process::id()));
         AdminState {
             registry: Arc::new(Registry::in_memory().unwrap()),
             flags: Arc::new(FlagStore::in_memory().unwrap()),
+            identity: Arc::new(IdentityStore::in_memory().unwrap()),
+            store: Arc::new(EventStore::open(dir).unwrap()),
             admin_token: admin_token.map(|s| Arc::new(s.to_string())),
         }
     }

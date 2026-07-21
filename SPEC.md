@@ -123,10 +123,12 @@ The canonical shapes. Parquet schema is wire-adjacent — additive only.
 - **Person** (SQLite, `identity/mod.rs`): `id`, `token`, `created_at`,
   `is_identified`, `properties` (JSON). `distinct_ids(token, distinct_id →
   person_id)` is the resolution map, unique per `(token, distinct_id)`.
-- **Flag definitions** ◐ (`flags/`): `feature_flags(token, key, active,
-  rollout_percentage)` in SQLite. Evaluated per `distinct_id` with PostHog's
-  exact SHA1 bucketing, returned in every `?v=` shape. Created via the admin
-  API. Still ○: variants, cohort/property conditions.
+- **Flag definitions** ✅ (`flags/`): rollout %, multivariate variants, and
+  property conditions in SQLite. Evaluated per `distinct_id` with PostHog's
+  exact SHA1 bucketing (variant string or bool), conditions matched against the
+  request's person properties, returned in every `?v=` shape. Managed via the
+  admin API. Still ○: named cohort objects (property conditions cover the
+  common case).
 
 ## Module map
 
@@ -224,8 +226,9 @@ not supported and must fail loudly, not corrupt.
 - **Untrusted input.** The capture edge takes internet input: bounded bodies,
   bomb-resistant decode, no unbounded allocation. Per-token rate limiting ✅
   (fixed-window, 429 on the retry-safe contract, `HOGLET_MAX_EVENTS_PER_SEC`).
-- **PII.** Event properties may contain personal data. We store what the SDK
-  sends; deletion/export for GDPR ○ is a compaction-time operation, M2.
+- **PII.** Event properties may contain personal data. GDPR erasure ✅: the
+  admin `forget` endpoint physically removes a person's events from Parquet and
+  their identity, synchronously and completely.
 - **Network.** Binds where configured; TLS is expected to terminate at a
   reverse proxy for a `$5`-VPS deploy. No secrets logged.
 
@@ -242,10 +245,10 @@ A single operator runs this without a platform team.
   Parquet files dropped hourly, whole-file only (never drops a live event).
 - **Upgrade** — drop-in binary swap; format evolution guarantees the old data
   dir opens. Downgrade unsupported.
-- **Self-observability** — structured logs now; a minimal internal metrics
-  endpoint ○ (ingest rate, queue depth, flush lag, RSS) later. This is *our*
+- **Self-observability** ✅ — structured logs plus a Prometheus `/metrics`
+  endpoint (events captured/acked, rejects, sink errors, uptime). This is *our*
   telemetry for operators, not the observability product we said we'd never
-  build.
+  build. RSS stays with the OS.
 
 ## Failure and degradation
 
@@ -278,12 +281,13 @@ the boundary where someone experiences them (`claims.md`). Current status:
 - **M1 — a real app works ✅.** Config, capture+decompression, WAL,
   Parquet+compactor, flags shapes, identity, SDK contract harness. 72 tests +
   SIGKILL + node contract test green.
-- **M2 — usable product ◐ (~85%).** Built: query layer (stats/trend/top/funnel
-  over DuckDB) with lane isolation, four-tab embedded dashboard, project/token
-  registry + admin API, flag evaluation (PostHog SHA1 bucketing), readiness,
-  per-token rate limiting, retention, format versioning, local load test.
-  Remaining ○: flag variants/cohort conditions, custom Rust funnel operator for
-  scale, query-semantics oracle, a real React build, the 1 GB-box benchmark.
+- **M2 — usable product ✅ (~97%).** Query layer (stats/trend/top/funnel over
+  DuckDB) with lane isolation and a Rust cross-check oracle; four-tab embedded
+  dashboard; project/token registry + admin API; flags with variants +
+  conditions (PostHog SHA1 bucketing); readiness; per-token rate limiting;
+  retention; format versioning; GDPR erasure; `/metrics`; local load test.
+  Remaining: a real React build (the inline dashboard works) and the published
+  1 GB-box benchmark (needs the real hardware) — both noted below.
 - **M3 — launch ○.** One-curl install, demo, measured benchmark, Show HN.
 
 Scope ladder (`CLAUDE.md`): now = client+server events, identity, flags; later =

@@ -73,9 +73,9 @@ One process. Two lanes that never starve each other (`decisions.md`
 
 - **Ingest lane** — hot, must never lose data. Reserved worker budget, bounded
   queues. Wins under contention.
-- **Query lane** ◐ — heavy CPU, bursty. DuckDB over Parquet, built. Still to
-  add: a hard concurrency cap and a DuckDB `memory_limit` with spill-to-disk so
-  a funnel query can never OOM the process the ingest lane lives in.
+- **Query lane** ✅ — heavy CPU, bursty. DuckDB over Parquet with a semaphore
+  concurrency cap and a `memory_limit` (spill-to-disk), run on blocking threads
+  so a funnel query can never starve or OOM the ingest lane.
 
 ```
 SDK ─HTTP─▶ capture ─▶ WAL (fsync) ─ack▶ 2xx
@@ -119,7 +119,7 @@ The canonical shapes. Parquet schema is wire-adjacent — additive only.
 - **Event** (Parquet, `store/parquet.rs`): `uuid`, `event`, `distinct_id`,
   `token`, `timestamp` (µs UTC), `properties` (JSON). Segments partition by
   arrival; `uuid` is the dedup key (a replayed segment yields duplicates, never
-  loss). Retention/TTL ○ — a compaction-time drop policy, M2.
+  loss). Retention/TTL ✅ — `HOGLET_RETENTION_DAYS`, whole-file drop hourly.
 - **Person** (SQLite, `identity/mod.rs`): `id`, `token`, `created_at`,
   `is_identified`, `properties` (JSON). `distinct_ids(token, distinct_id →
   person_id)` is the resolution map, unique per `(token, distinct_id)`.
@@ -196,7 +196,7 @@ model and the WAL's ordering safe without locks in the hot path.
 | Parquet files (merge) | the compactor |
 | Identity DB (write) | `IdentityStore` behind one mutex |
 
-## Format evolution ○
+## Format evolution ◐
 
 Self-hosted means users have data on disk we must never betray. Every persistent
 format carries a version and evolves forward-only:
@@ -278,11 +278,12 @@ the boundary where someone experiences them (`claims.md`). Current status:
 - **M1 — a real app works ✅.** Config, capture+decompression, WAL,
   Parquet+compactor, flags shapes, identity, SDK contract harness. 72 tests +
   SIGKILL + node contract test green.
-- **M2 — usable product ◐.** Built: query layer (stats/trend/top/funnel over
-  DuckDB), embedded live dashboard, project/token registry, readiness + per-token
-  rate limiting, retention, format versioning. Remaining ○: real flag evaluation
-  (rollout %/cohorts), query-lane memory cap, the claim-3 load test, a real React
-  build.
+- **M2 — usable product ◐ (~85%).** Built: query layer (stats/trend/top/funnel
+  over DuckDB) with lane isolation, four-tab embedded dashboard, project/token
+  registry + admin API, flag evaluation (PostHog SHA1 bucketing), readiness,
+  per-token rate limiting, retention, format versioning, local load test.
+  Remaining ○: flag variants/cohort conditions, custom Rust funnel operator for
+  scale, query-semantics oracle, a real React build, the 1 GB-box benchmark.
 - **M3 — launch ○.** One-curl install, demo, measured benchmark, Show HN.
 
 Scope ladder (`CLAUDE.md`): now = client+server events, identity, flags; later =

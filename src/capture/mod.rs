@@ -22,6 +22,7 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::identity::IdentityStore;
+use crate::ratelimit::RateLimiter;
 use crate::registry::{Decision, Registry};
 use crate::sink::EventSink;
 
@@ -30,6 +31,7 @@ pub struct CaptureState {
     pub sink: Arc<dyn EventSink>,
     pub identity: Arc<IdentityStore>,
     pub registry: Arc<Registry>,
+    pub limiter: Arc<RateLimiter>,
 }
 
 /// Body limit for browser-SDK endpoints (/e and friends).
@@ -110,6 +112,14 @@ async fn capture(
         {
             return StatusCode::UNAUTHORIZED.into_response();
         }
+        // Rate limit per token; 429 is retry-safe on the SDK's backoff.
+        if let Some(first) = batch.events.first()
+            && !state
+                .limiter
+                .allow(&first.token, batch.events.len() as u32, now.timestamp())
+        {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
         let events = batch.events;
         match state.sink.append(events.clone()).await {
             Ok(()) => {}
@@ -159,6 +169,7 @@ mod tests {
             sink: sink.clone(),
             identity: Arc::new(IdentityStore::in_memory().unwrap()),
             registry: Arc::new(Registry::in_memory().unwrap()),
+            limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
         };
         (router(state), sink)
     }

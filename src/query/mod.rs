@@ -10,7 +10,7 @@
 //! This is the dashboard's engine, not a PostHog-compatible surface —
 //! compatibility lives at the ingest edge, analytics behind it.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use duckdb::Connection;
 use serde::Serialize;

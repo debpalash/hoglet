@@ -28,6 +28,8 @@ pub struct IdentityStore {
 #[derive(Debug)]
 pub enum IdentityError {
     Db(rusqlite::Error),
+    /// On-disk DB is newer than this binary understands.
+    Incompatible(String),
 }
 
 impl From<rusqlite::Error> for IdentityError {
@@ -35,6 +37,10 @@ impl From<rusqlite::Error> for IdentityError {
         IdentityError::Db(e)
     }
 }
+
+/// Identity schema version (SPEC.md "Format evolution"). Migrations run
+/// forward-only at open; bump and add a step when the schema changes.
+const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS persons (
@@ -59,6 +65,7 @@ impl IdentityStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -67,6 +74,7 @@ impl IdentityStore {
     pub fn in_memory() -> Result<Self, IdentityError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -155,6 +163,21 @@ impl IdentityStore {
             .as_object()
             .cloned()
     }
+}
+
+/// Forward-only migration by `user_version`. A newer binary opening an older
+/// DB steps it up; an unknown-higher version fails loud (no silent downgrade).
+fn migrate(conn: &Connection) -> Result<(), IdentityError> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if current > SCHEMA_VERSION {
+        return Err(IdentityError::Incompatible(format!(
+            "identity db is version {current}, newer than this binary's {SCHEMA_VERSION}; \
+             downgrade unsupported"
+        )));
+    }
+    // Future steps: `if current < 2 { ...; }` etc.
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
 }
 
 fn ensure_person(

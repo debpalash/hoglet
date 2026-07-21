@@ -69,6 +69,31 @@ impl EventStore {
         Ok(files)
     }
 
+    /// Delete Parquet files whose newest event is older than `cutoff`
+    /// (SPEC.md "Operational contract" retention). Whole-file only: a file
+    /// straddling the cutoff is kept until all its events expire — bounded,
+    /// and never drops a live event. Returns files deleted.
+    pub fn enforce_retention(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> std::io::Result<usize> {
+        let mut deleted = 0;
+        for path in self.list_files()? {
+            let events = parquet::read_file(&path)?;
+            let max_ts = events.iter().map(|e| e.timestamp).max();
+            if let Some(max_ts) = max_ts
+                && max_ts < cutoff
+            {
+                std::fs::remove_file(&path)?;
+                deleted += 1;
+            }
+        }
+        if deleted > 0 {
+            std::fs::File::open(&self.dir)?.sync_all()?;
+        }
+        Ok(deleted)
+    }
+
     /// Merge small Parquet files into one. Returns the number of files
     /// merged (0 = nothing to do).
     pub fn compact(&self) -> std::io::Result<usize> {
@@ -175,5 +200,44 @@ mod tests {
         store.write_events(&[event("a")]).unwrap();
         assert_eq!(store.compact().unwrap(), 0);
         assert_eq!(store.list_files().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_deletes_only_fully_expired_files() {
+        use chrono::{Duration, Utc};
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().to_path_buf()).unwrap();
+
+        let mut old = event("old");
+        old.timestamp = Utc::now() - Duration::days(40);
+        let mut recent = event("recent");
+        recent.timestamp = Utc::now();
+        store.write_events(&[old]).unwrap(); // file 1: all old
+        store.write_events(&[recent]).unwrap(); // file 2: fresh
+
+        let cutoff = Utc::now() - Duration::days(30);
+        assert_eq!(store.enforce_retention(cutoff).unwrap(), 1);
+        // Fresh file survives.
+        let remaining: Vec<_> = store
+            .list_files()
+            .unwrap()
+            .iter()
+            .flat_map(|p| parquet::read_file(p).unwrap())
+            .map(|e| e.event)
+            .collect();
+        assert_eq!(remaining, vec!["recent"]);
+    }
+
+    #[test]
+    fn parquet_carries_schema_version() {
+        // `parquet` here is our submodule; `::parquet` is the crate.
+        use ::parquet::file::reader::{FileReader, SerializedFileReader};
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().to_path_buf()).unwrap();
+        let path = store.write_events(&[event("a")]).unwrap();
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let kv = reader.metadata().file_metadata().key_value_metadata().unwrap();
+        let ver = kv.iter().find(|k| k.key == "hoglet_schema_version").unwrap();
+        assert_eq!(ver.value.as_deref(), Some(parquet::SCHEMA_VERSION));
     }
 }

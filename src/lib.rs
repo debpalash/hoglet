@@ -8,6 +8,7 @@ pub mod capture;
 pub mod flush;
 pub mod identity;
 pub mod query;
+pub mod ratelimit;
 pub mod registry;
 pub mod routes;
 pub mod sink;
@@ -52,6 +53,7 @@ pub fn app() -> Router {
             sink: Arc::new(sink::LogSink),
             identity: Arc::new(identity::IdentityStore::in_memory().expect("in-memory sqlite")),
             registry: Arc::new(registry::Registry::in_memory().expect("in-memory sqlite")),
+            limiter: Arc::new(ratelimit::RateLimiter::new(ratelimit::DEFAULT_MAX_PER_SEC)),
         },
         readiness,
         Arc::new(query::QueryEngine::new(std::path::PathBuf::from(

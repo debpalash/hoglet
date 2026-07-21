@@ -136,7 +136,7 @@ fn urlencoding_decode(value: &str) -> Result<String, DecodeError> {
 
 fn looks_like_base64(payload: &[u8]) -> bool {
     !payload.is_empty()
-        && payload.len() % 4 == 0
+        && payload.len().is_multiple_of(4)
         && payload
             .iter()
             .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')

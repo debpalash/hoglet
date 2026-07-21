@@ -29,7 +29,10 @@ async fn main() {
     let store = std::sync::Arc::new(
         hoglet::store::EventStore::open(data_dir.join("events")).expect("cannot open event store"),
     );
-    hoglet::flush::spawn(wal.clone(), store);
+    let retention_days = std::env::var("HOGLET_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    hoglet::flush::spawn(wal.clone(), store, retention_days);
     let identity = std::sync::Arc::new(
         hoglet::identity::IdentityStore::open(&data_dir.join("identity.db"))
             .expect("cannot open identity store"),
@@ -41,10 +44,15 @@ async fn main() {
         )
         .expect("cannot init registry"),
     );
+    let max_per_sec = std::env::var("HOGLET_MAX_EVENTS_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(hoglet::ratelimit::DEFAULT_MAX_PER_SEC);
     let state = hoglet::capture::CaptureState {
         sink: std::sync::Arc::new(hoglet::wal::WalSink(wal)),
         identity,
         registry,
+        limiter: std::sync::Arc::new(hoglet::ratelimit::RateLimiter::new(max_per_sec)),
     };
     let engine = std::sync::Arc::new(hoglet::query::QueryEngine::new(data_dir.join("events")));
 

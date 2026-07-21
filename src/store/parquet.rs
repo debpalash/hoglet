@@ -13,9 +13,15 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use chrono::{DateTime, Utc};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
 use crate::capture::event::CapturedEvent;
+
+/// On-disk event schema version, stamped into every Parquet file's key-value
+/// metadata (SPEC.md "Format evolution"). Bump only on a breaking change; the
+/// reader must union versions. Additive columns do not bump this.
+pub const SCHEMA_VERSION: &str = "1";
 
 pub fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -65,7 +71,14 @@ fn to_record_batch(events: &[CapturedEvent]) -> Result<RecordBatch, arrow::error
 pub fn write_file(events: &[CapturedEvent], path: &Path) -> std::io::Result<()> {
     let batch = to_record_batch(events).map_err(std::io::Error::other)?;
     let file = File::create(path)?;
-    let mut writer = ArrowWriter::try_new(file, schema(), None).map_err(std::io::Error::other)?;
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+            "hoglet_schema_version".to_string(),
+            SCHEMA_VERSION.to_string(),
+        )]))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(file, schema(), Some(props)).map_err(std::io::Error::other)?;
     writer.write(&batch).map_err(std::io::Error::other)?;
     let file = writer.into_inner().map_err(std::io::Error::other)?;
     file.sync_all()

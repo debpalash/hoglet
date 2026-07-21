@@ -12,21 +12,47 @@ use crate::wal::{self, Wal};
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Spawn the background flush loop. Runs until the WAL closes.
-pub fn spawn(wal: Wal, store: Arc<EventStore>) -> tokio::task::JoinHandle<()> {
+/// Run retention at most this often, independent of the faster flush tick.
+const RETENTION_EVERY: Duration = Duration::from_secs(3600);
+
+/// Spawn the background flush loop. Runs until the WAL closes. When
+/// `retention_days` is set, fully-expired Parquet files are dropped hourly
+/// (SPEC.md "Operational contract").
+pub fn spawn(
+    wal: Wal,
+    store: Arc<EventStore>,
+    retention_days: Option<i64>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut retention = tokio::time::interval(RETENTION_EVERY);
+        retention.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tick.tick().await;
-            match flush_once(&wal, &store).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(events = n, "flushed WAL to Parquet"),
-                Err(FlushError::WalClosed) => return,
-                Err(FlushError::Io(e)) => {
-                    // Leave segments in place; next tick retries. Nothing is
-                    // acked-but-lost — the WAL still holds it all.
-                    tracing::error!("flush failed, will retry: {e}");
+            tokio::select! {
+                _ = tick.tick() => match flush_once(&wal, &store).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(events = n, "flushed WAL to Parquet"),
+                    Err(FlushError::WalClosed) => return,
+                    Err(FlushError::Io(e)) => {
+                        // Leave segments in place; next tick retries. Nothing
+                        // is acked-but-lost — the WAL still holds it all.
+                        tracing::error!("flush failed, will retry: {e}");
+                    }
+                },
+                _ = retention.tick() => {
+                    if let Some(days) = retention_days {
+                        let store = store.clone();
+                        let dropped = tokio::task::spawn_blocking(move || {
+                            let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+                            store.enforce_retention(cutoff)
+                        }).await;
+                        match dropped {
+                            Ok(Ok(n)) if n > 0 => tracing::info!(files = n, "retention dropped expired segments"),
+                            Ok(Err(e)) => tracing::error!("retention failed: {e}"),
+                            _ => {}
+                        }
+                    }
                 }
             }
         }

@@ -137,7 +137,7 @@ pub fn spec() -> Value {
             "/e/": {
                 "post": {
                     "tags": ["Capture"],
-                    "summary": "Capture events (browser SDK)",
+                    "summary": "Capture — /e",
                     "description": "One aliased handler also serving /capture, /track, /engage, \
                         /i/v0/e. Accepts a bare event array or a single event. Body may be gzip \
                         (magic-byte sniffed), base64, form-encoded (data=…), or raw JSON. \
@@ -166,7 +166,7 @@ pub fn spec() -> Value {
             "/batch/": {
                 "post": {
                     "tags": ["Capture"],
-                    "summary": "Capture events (server SDK batch)",
+                    "summary": "Batch capture — /batch",
                     "requestBody": { "content": { "application/json": {
                         "schema": { "$ref": "#/components/schemas/Batch" },
                         "example": { "api_key": "phc_demo", "batch": [
@@ -180,7 +180,7 @@ pub fn spec() -> Value {
             "/array/{token}/config": {
                 "get": {
                     "tags": ["Config"],
-                    "summary": "SDK bootstrap config",
+                    "summary": "SDK config",
                     "description": "The first request posthog-js makes. Advertises supported \
                         compression and which features are enabled; unimplemented features are \
                         returned as false so the SDK never calls them.",
@@ -191,7 +191,7 @@ pub fn spec() -> Value {
             "/flags/": {
                 "post": {
                     "tags": ["Flags"],
-                    "summary": "Evaluate feature flags",
+                    "summary": "Evaluate flags",
                     "description": "Also served at /decide. ?v= selects the response shape \
                         (v1 = enabled-key array, v2 = {key: bool|variant} map, default = FlagDetails). \
                         Bucketed per distinct_id with PostHog's SHA1 hash. Conditions match against \
@@ -205,14 +205,14 @@ pub fn spec() -> Value {
             },
             "/api/stats": {
                 "get": {
-                    "tags": ["Query"], "summary": "Totals for a project",
+                    "tags": ["Query"], "summary": "Stats",
                     "parameters": [{ "name": "token", "in": "query", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "OK", "content": {"application/json": {"schema": {"$ref":"#/components/schemas/Stats"}}}}}
                 }
             },
             "/api/top_events": {
                 "get": {
-                    "tags": ["Query"], "summary": "Event counts, descending",
+                    "tags": ["Query"], "summary": "Top events",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "limit", "in": "query", "schema": {"type":"integer","default":20} }
@@ -222,7 +222,7 @@ pub fn spec() -> Value {
             },
             "/api/trend": {
                 "get": {
-                    "tags": ["Query"], "summary": "Daily counts of one event",
+                    "tags": ["Query"], "summary": "Trend",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "event", "in": "query", "required": true, "schema": {"type":"string"} },
@@ -233,7 +233,7 @@ pub fn spec() -> Value {
             },
             "/api/funnel": {
                 "post": {
-                    "tags": ["Query"], "summary": "Ordered funnel over steps",
+                    "tags": ["Query"], "summary": "Funnel",
                     "requestBody": { "content": { "application/json": {
                         "example": { "token": "phc_demo", "steps": ["signup", "activate", "purchase"] }
                     }}},
@@ -242,7 +242,7 @@ pub fn spec() -> Value {
             },
             "/api/recent": {
                 "get": {
-                    "tags": ["Query"], "summary": "Live event stream",
+                    "tags": ["Query"], "summary": "Recent events",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "limit", "in": "query", "schema": {"type":"integer","default":20} }
@@ -252,14 +252,14 @@ pub fn spec() -> Value {
             },
             "/api/flags": {
                 "get": {
-                    "tags": ["Query"], "summary": "List flag definitions",
+                    "tags": ["Query"], "summary": "Flags list",
                     "parameters": [{ "name": "token", "in": "query", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "OK", "content": {"application/json": {"schema": {"type":"array","items":{"$ref":"#/components/schemas/FlagDef"}}}}}}
                 }
             },
             "/api/admin/projects": {
                 "post": {
-                    "tags": ["Admin"], "summary": "Create a project/token",
+                    "tags": ["Admin"], "summary": "Create project",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": { "token": "phc_acme", "name": "Acme" } }}},
                     "responses": { "201": { "description": "Created" }, "401": { "description": "Bad admin token" }, "404": { "description": "Admin API disabled" } }
@@ -267,7 +267,7 @@ pub fn spec() -> Value {
             },
             "/api/admin/flags": {
                 "post": {
-                    "tags": ["Admin"], "summary": "Create or update a flag",
+                    "tags": ["Admin"], "summary": "Upsert flag",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": {
                         "token": "phc_demo", "key": "new-checkout", "rollout_percentage": 60,
@@ -279,7 +279,7 @@ pub fn spec() -> Value {
             },
             "/api/admin/forget": {
                 "post": {
-                    "tags": ["Admin"], "summary": "GDPR erase a person",
+                    "tags": ["Admin"], "summary": "Erase person (GDPR)",
                     "description": "Physically removes a person's events from Parquet and their identity.",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": { "token": "phc_demo", "distinct_id": "forget-me" } }}},
@@ -288,7 +288,7 @@ pub fn spec() -> Value {
             },
             "/health": { "get": { "tags": ["Ops"], "summary": "Liveness", "responses": { "200": { "description": "Alive" } } } },
             "/ready": { "get": { "tags": ["Ops"], "summary": "Readiness", "responses": { "200": { "description": "Ready" }, "503": { "description": "Not ready" } } } },
-            "/metrics": { "get": { "tags": ["Ops"], "summary": "Prometheus metrics", "responses": { "200": { "description": "text/plain exposition" } } } }
+            "/metrics": { "get": { "tags": ["Ops"], "summary": "Metrics", "responses": { "200": { "description": "text/plain exposition" } } } }
         },
         "components": {
             "securitySchemes": {

@@ -22,12 +22,14 @@ use chrono::Utc;
 use serde_json::json;
 
 use crate::identity::IdentityStore;
+use crate::registry::{Decision, Registry};
 use crate::sink::EventSink;
 
 #[derive(Clone)]
 pub struct CaptureState {
     pub sink: Arc<dyn EventSink>,
     pub identity: Arc<IdentityStore>,
+    pub registry: Arc<Registry>,
 }
 
 /// Body limit for browser-SDK endpoints (/e and friends).
@@ -100,6 +102,14 @@ async fn capture(
 
     // Empty after filtering is still success — never make clients retry.
     if !batch.events.is_empty() {
+        // Token authenticity (SPEC.md "Security and tenancy"): shape was
+        // checked at parse; the registry adds project authenticity. Open
+        // mode (no projects) accepts any valid token.
+        if let Some(first) = batch.events.first()
+            && state.registry.check(&first.token) == Decision::Reject
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
         let events = batch.events;
         match state.sink.append(events.clone()).await {
             Ok(()) => {}
@@ -148,6 +158,7 @@ mod tests {
         let state = CaptureState {
             sink: sink.clone(),
             identity: Arc::new(IdentityStore::in_memory().unwrap()),
+            registry: Arc::new(Registry::in_memory().unwrap()),
         };
         (router(state), sink)
     }

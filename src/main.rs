@@ -34,10 +34,19 @@ async fn main() {
         hoglet::identity::IdentityStore::open(&data_dir.join("identity.db"))
             .expect("cannot open identity store"),
     );
+    let registry = std::sync::Arc::new(
+        hoglet::registry::Registry::open(
+            rusqlite::Connection::open(data_dir.join("projects.db"))
+                .expect("cannot open projects db"),
+        )
+        .expect("cannot init registry"),
+    );
     let state = hoglet::capture::CaptureState {
         sink: std::sync::Arc::new(hoglet::wal::WalSink(wal)),
         identity,
+        registry,
     };
+    let engine = std::sync::Arc::new(hoglet::query::QueryEngine::new(data_dir.join("events")));
 
     let readiness = hoglet::routes::health::Readiness::new();
 
@@ -49,7 +58,7 @@ async fn main() {
     readiness.mark_ready();
     tracing::info!("hoglet listening on {addr}");
 
-    axum::serve(listener, hoglet::app_with_state(state, readiness))
+    axum::serve(listener, hoglet::app_with_state(state, readiness, engine))
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
         })

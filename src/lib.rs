@@ -7,6 +7,8 @@
 pub mod capture;
 pub mod flush;
 pub mod identity;
+pub mod query;
+pub mod registry;
 pub mod routes;
 pub mod sink;
 pub mod store;
@@ -25,17 +27,23 @@ use capture::CaptureState;
 /// CORS is maximally permissive by contract (compat-spec.md "Responses"):
 /// old SDKs and reverse proxies send funky headers, and analytics endpoints
 /// are public by nature.
-pub fn app_with_state(state: CaptureState, readiness: routes::health::Readiness) -> Router {
+pub fn app_with_state(
+    state: CaptureState,
+    readiness: routes::health::Readiness,
+    engine: Arc<query::QueryEngine>,
+) -> Router {
     Router::new()
+        .merge(routes::dashboard::router())
         .merge(routes::config::router())
         .merge(routes::flags::router())
         .merge(routes::health::router(readiness))
+        .merge(routes::api::router(engine))
         .merge(capture::router(state))
         .layer(CorsLayer::very_permissive())
 }
 
-/// Default app: log sink, in-memory identity, immediately ready. For tests
-/// and dry runs.
+/// Default app: log sink, in-memory identity, empty query engine, immediately
+/// ready. For tests and dry runs.
 pub fn app() -> Router {
     let readiness = routes::health::Readiness::new();
     readiness.mark_ready();
@@ -43,7 +51,11 @@ pub fn app() -> Router {
         CaptureState {
             sink: Arc::new(sink::LogSink),
             identity: Arc::new(identity::IdentityStore::in_memory().expect("in-memory sqlite")),
+            registry: Arc::new(registry::Registry::in_memory().expect("in-memory sqlite")),
         },
         readiness,
+        Arc::new(query::QueryEngine::new(std::path::PathBuf::from(
+            "/nonexistent-hoglet-events",
+        ))),
     )
 }

@@ -1,5 +1,5 @@
 //! `/metrics` — Prometheus text exposition of Hoglet's own counters
-//! (SPEC.md "self-observability").
+//! (spec/README.md "self-observability").
 
 use std::sync::Arc;
 

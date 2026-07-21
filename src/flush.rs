@@ -17,7 +17,7 @@ const RETENTION_EVERY: Duration = Duration::from_secs(3600);
 
 /// Spawn the background flush loop. Runs until the WAL closes. When
 /// `retention_days` is set, fully-expired Parquet files are dropped hourly
-/// (SPEC.md "Operational contract").
+/// (spec/README.md "Operational contract").
 pub fn spawn(
     wal: Wal,
     store: Arc<EventStore>,

@@ -1,5 +1,5 @@
 //! Request-body parsing and per-event field resolution
-//! (compat-spec.md "Request body").
+//! (spec/wire-compat.md "Request body").
 //!
 //! The body is an untagged union of four shapes; token, distinct_id,
 //! timestamp, and uuid resolution each follow PostHog's exact precedence.
@@ -159,7 +159,7 @@ fn resolve_event(
     let timestamp = resolve_timestamp(&obj, &properties, sent_at, now)?;
 
     // Client-supplied uuid wins; otherwise UUIDv7 seeded from the *resolved
-    // event timestamp*, not ingestion time (compat-spec.md).
+    // event timestamp*, not ingestion time (spec/wire-compat.md).
     let uuid = match obj.get("uuid").and_then(Value::as_str) {
         Some(s) => Uuid::parse_str(s).map_err(|_| CaptureError::Malformed("invalid uuid"))?,
         None => uuid_v7_at(timestamp),
@@ -228,7 +228,7 @@ fn resolve_distinct_id(
     Ok(s.chars().take(MAX_DISTINCT_ID_CHARS).collect())
 }
 
-/// Timestamp precedence (compat-spec.md "Timestamp"):
+/// Timestamp precedence (spec/wire-compat.md "Timestamp"):
 /// `offset` (ms ago) wins outright → now - offset. Else parse `timestamp`
 /// and correct clock skew by `sent_at - now` unless `$ignore_sent_at`.
 /// Clamp >23h future to now. No timestamp → now.

@@ -1,4 +1,4 @@
-//! The dashboard, embedded in the binary (SPEC.md "Dashboard").
+//! The dashboard, embedded in the binary (spec/README.md "Dashboard").
 //!
 //! A real React + TypeScript app (source in `web/`, types generated from the
 //! Rust API structs by ts-rs) built by Vite into `web/dist/` and compiled into

@@ -1,4 +1,4 @@
-//! Minimal admin API (SPEC.md "Security and tenancy" — project/flag
+//! Minimal admin API (spec/README.md "Security and tenancy" — project/flag
 //! management). Creates projects and feature flags so the registry and flag
 //! evaluator are reachable, not just internal.
 //!

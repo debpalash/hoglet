@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::capture::event::CapturedEvent;
 
 /// On-disk event schema version, stamped into every Parquet file's key-value
-/// metadata (SPEC.md "Format evolution"). Bump only on a breaking change; the
+/// metadata (spec/README.md "Format evolution"). Bump only on a breaking change; the
 /// reader must union versions. Additive columns do not bump this.
 pub const SCHEMA_VERSION: &str = "1";
 

@@ -1,6 +1,6 @@
 //! Project API token validation.
 //!
-//! Owns the token invariant for the whole binary (compat-spec.md "Token
+//! Owns the token invariant for the whole binary (spec/wire-compat.md "Token
 //! resolution"). Every endpoint that touches a token goes through
 //! [`validate`]; no handler re-implements these rules.
 

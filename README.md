@@ -60,7 +60,7 @@ Open `http://localhost:8000/` for the live dashboard.
 One binary, two lanes: a hot ingest path (capture → WAL → Parquet) that must
 never lose data, and a query lane (DuckDB, memory-capped) that can't starve it.
 Persons/identity/flags live in SQLite. Full map in [`SPEC.md`](SPEC.md);
-compatibility contract in [`compat-spec.md`](compat-spec.md).
+compatibility contract in [`spec/wire-compat.md`](spec/wire-compat.md).
 
 ## Testing
 

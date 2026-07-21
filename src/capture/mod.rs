@@ -1,5 +1,5 @@
 //! Capture endpoints — one handler aliased across every path PostHog SDKs
-//! post events to (compat-spec.md "Endpoints").
+//! post events to (spec/wire-compat.md "Endpoints").
 //!
 //! Response codes are load-bearing: 200 normally, 204 when `beacon=1`, 4xx
 //! for anything the client must not retry, 503 only for retryable sink
@@ -110,7 +110,7 @@ async fn capture(
 
     // Empty after filtering is still success — never make clients retry.
     if !batch.events.is_empty() {
-        // Token authenticity (SPEC.md "Security and tenancy"): shape was
+        // Token authenticity (spec/README.md "Security and tenancy"): shape was
         // checked at parse; the registry adds project authenticity. Open
         // mode (no projects) accepts any valid token.
         if let Some(first) = batch.events.first()

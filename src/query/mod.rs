@@ -1,4 +1,4 @@
-//! Query layer — DuckDB read-only over Parquet segments (SPEC.md "query
+//! Query layer — DuckDB read-only over Parquet segments (spec/README.md "query
 //! lane", stack.md).
 //!
 //! DuckDB opens the Parquet files as an external table; we never keep a live
@@ -24,7 +24,7 @@ use ts_rs::TS;
 pub const MAX_FUNNEL_STEPS: usize = 12;
 
 /// DuckDB memory ceiling per query. The query lane must never OOM the process
-/// the ingest lane lives in (SPEC.md two-lanes invariant); DuckDB spills to
+/// the ingest lane lives in (spec/README.md two-lanes invariant); DuckDB spills to
 /// disk past this instead of allocating without bound.
 pub const QUERY_MEMORY_LIMIT: &str = "256MB";
 

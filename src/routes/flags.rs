@@ -1,5 +1,5 @@
 //! `/flags` and `/decide` — one handler, `?v=` selects the response shape
-//! (compat-spec.md "Flags response shapes").
+//! (spec/wire-compat.md "Flags response shapes").
 //!
 //! This module owns the wire *shapes*; `crate::flags` owns *which flags are on
 //! for whom*. Evaluations come from the flag store, keyed by token, bucketed

@@ -1,5 +1,5 @@
 //! Identity — persons, distinct_ids, and PostHog's merge semantics
-//! (compat-spec.md "Identity", claims.md claim 4).
+//! (spec/wire-compat.md "Identity", claims.md claim 4).
 //!
 //! Invariants:
 //! - A (token, distinct_id) maps to exactly one person at any time.
@@ -38,7 +38,7 @@ impl From<rusqlite::Error> for IdentityError {
     }
 }
 
-/// Identity schema version (SPEC.md "Format evolution"). Migrations run
+/// Identity schema version (spec/README.md "Format evolution"). Migrations run
 /// forward-only at open; bump and add a step when the schema changes.
 const SCHEMA_VERSION: i64 = 1;
 
@@ -123,7 +123,7 @@ impl IdentityStore {
     }
 
     /// Forget a distinct_id: remove its person and all that person's
-    /// distinct_id mappings (SPEC.md "PII" / GDPR). Returns true if a person
+    /// distinct_id mappings (spec/README.md "PII" / GDPR). Returns true if a person
     /// was removed.
     pub fn forget(&self, token: &str, distinct_id: &str) -> Result<bool, IdentityError> {
         let mut conn = self.conn.lock().unwrap();

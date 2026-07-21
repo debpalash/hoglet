@@ -1,4 +1,4 @@
-//! Dashboard query API (SPEC.md "query lane"). Internal JSON, not a
+//! Dashboard query API (spec/README.md "query lane"). Internal JSON, not a
 //! PostHog-compatible surface — the dashboard is ours to shape.
 //!
 //! Every query acquires a permit (the query-lane concurrency cap) and runs on

@@ -1,4 +1,4 @@
-//! Feature flag definitions and evaluation (compat-spec.md "Flags").
+//! Feature flag definitions and evaluation (spec/wire-compat.md "Flags").
 //!
 //! Bucketing matches PostHog byte-for-byte: `sha1("{key}.{distinct_id}")`,
 //! first 60 bits as a fraction in [0,1), enabled when that fraction is below

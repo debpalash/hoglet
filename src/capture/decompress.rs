@@ -1,4 +1,4 @@
-//! Payload decoding for capture endpoints (compat-spec.md "Decompression").
+//! Payload decoding for capture endpoints (spec/wire-compat.md "Decompression").
 //!
 //! Order is load-bearing and mirrors PostHog's own capture service:
 //! 1. `application/x-www-form-urlencoded` → unwrap `data=<...>` first (the
@@ -89,7 +89,7 @@ pub fn decode(
 ///
 /// The `+`→space quirk: urldecoding turns `+` into space, but `+` is a valid
 /// base64 character. If the decoded value looks like base64-with-spaces,
-/// restore spaces to `+` (compat-spec.md).
+/// restore spaces to `+` (spec/wire-compat.md).
 fn parse_form(body: &[u8]) -> Result<(Vec<u8>, Option<String>), DecodeError> {
     let text = std::str::from_utf8(body).map_err(|_| DecodeError::Undecodable)?;
     let mut data: Option<String> = None;

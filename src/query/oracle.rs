@@ -1,5 +1,5 @@
 //! Independent reference implementation of the analytics, in plain Rust
-//! (SPEC.md "query lane" oracle; decisions.md build method).
+//! (spec/README.md "query lane" oracle; decisions.md build method).
 //!
 //! This computes the same numbers as the DuckDB SQL — stats, top events,
 //! funnel — but from a `&[CapturedEvent]` slice with HashMaps and sorts,

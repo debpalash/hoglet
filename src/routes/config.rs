@@ -1,6 +1,6 @@
 //! `GET /array/:token/config` — the first request posthog-js makes.
 //!
-//! Implements compat-spec.md "Config response". This endpoint is the hard
+//! Implements spec/wire-compat.md "Config response". This endpoint is the hard
 //! requirement: if it fails or is unparseable the SDK breaks; everything else
 //! degrades gracefully. Features we don't implement are declared off
 //! (`sessionRecording`, `surveys`, `heatmaps`) so the SDK never tries them.

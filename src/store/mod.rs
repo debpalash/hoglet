@@ -70,7 +70,7 @@ impl EventStore {
     }
 
     /// Delete Parquet files whose newest event is older than `cutoff`
-    /// (SPEC.md "Operational contract" retention). Whole-file only: a file
+    /// (spec/README.md "Operational contract" retention). Whole-file only: a file
     /// straddling the cutoff is kept until all its events expire — bounded,
     /// and never drops a live event. Returns files deleted.
     pub fn enforce_retention(
@@ -95,7 +95,7 @@ impl EventStore {
     }
 
     /// Physically remove every event for `distinct_id` under `token`
-    /// (SPEC.md "PII" / GDPR). Rewrites each Parquet file without the matching
+    /// (spec/README.md "PII" / GDPR). Rewrites each Parquet file without the matching
     /// rows; deletes a file that becomes empty. Synchronous and complete — the
     /// person's events are gone when this returns. Returns rows removed.
     pub fn purge_distinct_id(&self, token: &str, distinct_id: &str) -> std::io::Result<usize> {

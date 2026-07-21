@@ -1,4 +1,4 @@
-//! Operational metrics (SPEC.md "self-observability").
+//! Operational metrics (spec/README.md "self-observability").
 //!
 //! Our telemetry for the operator running Hoglet — ingest counters and
 //! uptime, in Prometheus text format at `/metrics`. This is not the

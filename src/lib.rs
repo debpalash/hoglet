@@ -1,6 +1,6 @@
 //! Hoglet — PostHog-compatible product analytics. One binary.
 //!
-//! The wire contract lives in `compat-spec.md` at the repo root; every handler
+//! The wire contract lives in `spec/wire-compat.md` at the repo root; every handler
 //! cites the section it implements. PostHog wire semantics at the edge,
 //! byte-for-byte — anything custom stays behind it.
 
@@ -27,7 +27,7 @@ use capture::CaptureState;
 
 /// Build the full application router.
 ///
-/// CORS is maximally permissive by contract (compat-spec.md "Responses"):
+/// CORS is maximally permissive by contract (spec/wire-compat.md "Responses"):
 /// old SDKs and reverse proxies send funky headers, and analytics endpoints
 /// are public by nature.
 #[allow(clippy::too_many_arguments)]

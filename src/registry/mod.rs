@@ -1,4 +1,4 @@
-//! Project/token registry (SPEC.md "Security and tenancy").
+//! Project/token registry (spec/README.md "Security and tenancy").
 //!
 //! Turns a token from an opaque namespace into an authenticated project.
 //! Stored in SQLite alongside identity.

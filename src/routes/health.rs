@@ -1,4 +1,4 @@
-//! Liveness and readiness (SPEC.md "Operational contract").
+//! Liveness and readiness (spec/README.md "Operational contract").
 //!
 //! `/health` is liveness: the process is up. `/ready` gates traffic — it is
 //! not ready until WAL recovery and the stores are open, closing the

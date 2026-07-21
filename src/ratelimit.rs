@@ -1,4 +1,4 @@
-//! Per-token rate limiting (SPEC.md "Security and tenancy").
+//! Per-token rate limiting (spec/README.md "Security and tenancy").
 //!
 //! Fixed one-second window per token. The whole table resets when the wall
 //! second ticks, which bounds memory to the number of distinct tokens seen in

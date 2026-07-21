@@ -167,6 +167,7 @@ pub fn spec() -> Value {
                 "post": {
                     "tags": ["Capture"],
                     "summary": "Batch capture — /batch",
+                    "description": "Server-SDK batch ingestion. Body is {api_key, batch:[events], sent_at?}; the batch-level api_key wins over per-event tokens. sent_at corrects client clock skew. Same compression handling and response contract as /e.",
                     "requestBody": { "content": { "application/json": {
                         "schema": { "$ref": "#/components/schemas/Batch" },
                         "example": { "api_key": "phc_demo", "batch": [
@@ -206,6 +207,7 @@ pub fn spec() -> Value {
             "/api/stats": {
                 "get": {
                     "tags": ["Query"], "summary": "Stats",
+                    "description": "Project totals: event count, unique persons, and events in the last 24h. Counts are uuid-deduplicated, so replayed segments never inflate numbers.",
                     "parameters": [{ "name": "token", "in": "query", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "OK", "content": {"application/json": {"schema": {"$ref":"#/components/schemas/Stats"}}}}}
                 }
@@ -213,6 +215,7 @@ pub fn spec() -> Value {
             "/api/top_events": {
                 "get": {
                     "tags": ["Query"], "summary": "Top events",
+                    "description": "Event names ranked by count, highest first. Backs the dashboard's Top Events panel.",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "limit", "in": "query", "schema": {"type":"integer","default":20} }
@@ -223,6 +226,7 @@ pub fn spec() -> Value {
             "/api/trend": {
                 "get": {
                     "tags": ["Query"], "summary": "Trend",
+                    "description": "Daily counts of a single event over the last N days (default 30, max 365). Days with zero events are omitted.",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "event", "in": "query", "required": true, "schema": {"type":"string"} },
@@ -234,6 +238,7 @@ pub fn spec() -> Value {
             "/api/funnel": {
                 "post": {
                     "tags": ["Query"], "summary": "Funnel",
+                    "description": "Ordered conversion funnel: for steps [A,B,C], how many distinct persons did A, then B at-or-after A, then C at-or-after B. Monotonically non-increasing. Max 12 steps.",
                     "requestBody": { "content": { "application/json": {
                         "example": { "token": "phc_demo", "steps": ["signup", "activate", "purchase"] }
                     }}},
@@ -243,6 +248,7 @@ pub fn spec() -> Value {
             "/api/recent": {
                 "get": {
                     "tags": ["Query"], "summary": "Recent events",
+                    "description": "Newest events first — the dashboard's live stream. Max 200 per request.",
                     "parameters": [
                         { "name": "token", "in": "query", "required": true, "schema": {"type":"string"} },
                         { "name": "limit", "in": "query", "schema": {"type":"integer","default":20} }
@@ -253,6 +259,7 @@ pub fn spec() -> Value {
             "/api/flags": {
                 "get": {
                     "tags": ["Query"], "summary": "Flags list",
+                    "description": "All flag definitions for a project, including rollout percentage and variants. Read-only; definitions are managed via the Admin API.",
                     "parameters": [{ "name": "token", "in": "query", "required": true, "schema": {"type":"string"} }],
                     "responses": { "200": { "description": "OK", "content": {"application/json": {"schema": {"type":"array","items":{"$ref":"#/components/schemas/FlagDef"}}}}}}
                 }
@@ -260,6 +267,7 @@ pub fn spec() -> Value {
             "/api/admin/projects": {
                 "post": {
                     "tags": ["Admin"], "summary": "Create project",
+                    "description": "Registers a project token. With zero projects Hoglet runs in open mode (any well-formed token ingests); creating the first project flips to closed mode where only registered tokens are accepted.",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": { "token": "phc_acme", "name": "Acme" } }}},
                     "responses": { "201": { "description": "Created" }, "401": { "description": "Bad admin token" }, "404": { "description": "Admin API disabled" } }
@@ -268,6 +276,7 @@ pub fn spec() -> Value {
             "/api/admin/flags": {
                 "post": {
                     "tags": ["Admin"], "summary": "Upsert flag",
+                    "description": "Create or update a feature flag: rollout percentage, active state, optional weighted variants (multivariate), and optional property conditions matched against person_properties at evaluation.",
                     "security": [{ "adminBearer": [] }],
                     "requestBody": { "content": { "application/json": { "example": {
                         "token": "phc_demo", "key": "new-checkout", "rollout_percentage": 60,
@@ -286,9 +295,12 @@ pub fn spec() -> Value {
                     "responses": { "200": { "description": "Erased", "content": {"application/json": {"example": {"events_removed": 3}}}}}
                 }
             },
-            "/health": { "get": { "tags": ["Ops"], "summary": "Liveness", "responses": { "200": { "description": "Alive" } } } },
-            "/ready": { "get": { "tags": ["Ops"], "summary": "Readiness", "responses": { "200": { "description": "Ready" }, "503": { "description": "Not ready" } } } },
-            "/metrics": { "get": { "tags": ["Ops"], "summary": "Metrics", "responses": { "200": { "description": "text/plain exposition" } } } }
+            "/health": { "get": { "tags": ["Ops"], "summary": "Liveness",
+                    "description": "Process-up check. Always 200 while the server runs; carries no readiness meaning.", "responses": { "200": { "description": "Alive" } } } },
+            "/ready": { "get": { "tags": ["Ops"], "summary": "Readiness",
+                    "description": "Traffic gate: 200 only after WAL recovery finished and stores are open, else 503. Point load-balancer health checks here.", "responses": { "200": { "description": "Ready" }, "503": { "description": "Not ready" } } } },
+            "/metrics": { "get": { "tags": ["Ops"], "summary": "Metrics",
+                    "description": "Hoglet's own operational counters in Prometheus text format: events captured/acked, rejected requests, sink errors, uptime.", "responses": { "200": { "description": "text/plain exposition" } } } }
         },
         "components": {
             "securitySchemes": {

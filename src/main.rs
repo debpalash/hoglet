@@ -72,9 +72,13 @@ async fn main() {
     readiness.mark_ready();
     tracing::info!("hoglet listening on {addr}");
 
+    let admin_token = std::env::var("HOGLET_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::sync::Arc::new);
     axum::serve(
         listener,
-        hoglet::app_with_state(state, readiness, engine, flag_store),
+        hoglet::app_with_state(state, readiness, engine, flag_store, admin_token),
     )
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();

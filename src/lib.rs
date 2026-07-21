@@ -34,13 +34,20 @@ pub fn app_with_state(
     readiness: routes::health::Readiness,
     engine: Arc<query::QueryEngine>,
     flag_store: Arc<flags::FlagStore>,
+    admin_token: Option<Arc<String>>,
 ) -> Router {
+    let admin = routes::admin::AdminState {
+        registry: state.registry.clone(),
+        flags: flag_store.clone(),
+        admin_token,
+    };
     Router::new()
         .merge(routes::dashboard::router())
         .merge(routes::config::router())
         .merge(routes::flags::router(flag_store))
         .merge(routes::health::router(readiness))
         .merge(routes::api::router(engine))
+        .merge(routes::admin::router(admin))
         .merge(capture::router(state))
         .layer(CorsLayer::very_permissive())
 }
@@ -62,5 +69,6 @@ pub fn app() -> Router {
             "/nonexistent-hoglet-events",
         ))),
         Arc::new(flags::FlagStore::in_memory().expect("in-memory sqlite")),
+        None,
     )
 }

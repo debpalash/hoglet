@@ -123,9 +123,10 @@ The canonical shapes. Parquet schema is wire-adjacent — additive only.
 - **Person** (SQLite, `identity/mod.rs`): `id`, `token`, `created_at`,
   `is_identified`, `properties` (JSON). `distinct_ids(token, distinct_id →
   person_id)` is the resolution map, unique per `(token, distinct_id)`.
-- **Flag definitions** ○: not yet stored. `routes/flags.rs` returns correct
-  shapes over an empty set; real evaluation (rollout %, cohorts) is M2, keyed by
-  `token`.
+- **Flag definitions** ◐ (`flags/`): `feature_flags(token, key, active,
+  rollout_percentage)` in SQLite. Evaluated per `distinct_id` with PostHog's
+  exact SHA1 bucketing, returned in every `?v=` shape. Created via the admin
+  API. Still ○: variants, cohort/property conditions.
 
 ## Module map
 
@@ -215,10 +216,11 @@ not supported and must fail loudly, not corrupt.
 
 ## Security and tenancy ◐
 
-- **Token authenticity** ◐ — `registry/` gives projects real identity. Open mode
+- **Token authenticity** ✅ — `registry/` gives projects real identity. Open mode
   (zero projects) accepts any shape-valid token so a hobby install needs no
   setup; creating a project flips to closed mode where only registered tokens
-  are accepted. Still ○: a project-management API/UI to create and revoke them.
+  are accepted. Managed via the admin API (`routes/admin.rs`), guarded by
+  `HOGLET_ADMIN_TOKEN` and disabled by default. Still ○: revocation, a UI.
 - **Untrusted input.** The capture edge takes internet input: bounded bodies,
   bomb-resistant decode, no unbounded allocation. Per-token rate limiting ✅
   (fixed-window, 429 on the retry-safe contract, `HOGLET_MAX_EVENTS_PER_SEC`).

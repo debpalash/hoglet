@@ -32,13 +32,63 @@ async fn scalar_js() -> Response {
 }
 
 async fn docs_page() -> Html<&'static str> {
+    // Hoglet theme: the dashboard's palette (web/src/styles.css) mapped onto
+    // Scalar's CSS variables. theme:'none' so ours is the only skin.
     Html(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Hoglet API</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🦔</text></svg>" />
+  <style>
+    :root, .dark-mode, .light-mode {
+      /* surfaces */
+      --scalar-background-1: #0b0d10;
+      --scalar-background-2: #14181d;
+      --scalar-background-3: #1a1f26;
+      --scalar-background-accent: #ffb45414;
+      /* text */
+      --scalar-color-1: #e6edf3;
+      --scalar-color-2: #8b98a5;
+      --scalar-color-3: #6b7681;
+      --scalar-color-accent: #ffb454;
+      /* lines & controls */
+      --scalar-border-color: #232a31;
+      --scalar-button-1: #ffb454;
+      --scalar-button-1-color: #0b0d10;
+      --scalar-button-1-hover: #ffc678;
+      /* semantic */
+      --scalar-color-green: #3fb950;
+      --scalar-color-red: #f47067;
+      --scalar-color-yellow: #ffb454;
+      --scalar-color-blue: #58a6ff;
+      --scalar-color-orange: #ffb454;
+      --scalar-color-purple: #bc8cff;
+      /* sidebar */
+      --scalar-sidebar-background-1: #0b0d10;
+      --scalar-sidebar-color-1: #e6edf3;
+      --scalar-sidebar-color-2: #8b98a5;
+      --scalar-sidebar-color-active: #ffb454;
+      --scalar-sidebar-item-active-background: #ffb45414;
+      --scalar-sidebar-item-hover-background: #14181d;
+      --scalar-sidebar-border-color: #232a31;
+      --scalar-sidebar-search-background: #14181d;
+      --scalar-sidebar-search-color: #8b98a5;
+      --scalar-sidebar-search-border-color: #232a31;
+      /* type — the dashboard is mono; docs get mono headings, readable body */
+      --scalar-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --scalar-font-code: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    /* mono, uppercase section headings — the dashboard's panel-title look */
+    .section-header, .sidebar-heading, h2.t-editor__heading {
+      font-family: var(--scalar-font-code) !important;
+      letter-spacing: .03em;
+    }
+    /* amber method badges pop on the dark ground */
+    .sidebar-heading-type, .http-verb { font-family: var(--scalar-font-code) !important; }
+  </style>
 </head>
 <body>
   <div id="app"></div>
@@ -46,12 +96,14 @@ async fn docs_page() -> Html<&'static str> {
   <script>
     Scalar.createApiReference('#app', {
       url: '/openapi.json',
-      theme: 'kepler',
+      theme: 'none',
       darkMode: true,
+      hideDarkModeToggle: true,
+      metaData: { title: 'Hoglet API — one binary, PostHog-compatible' },
     })
   </script>
 </body>
-</html>"#,
+</html>"##,
     )
 }
 

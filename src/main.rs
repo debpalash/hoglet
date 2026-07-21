@@ -39,12 +39,17 @@ async fn main() {
         identity,
     };
 
+    let readiness = hoglet::routes::health::Readiness::new();
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
+    // Stores are open and the flusher is running: declare ready so /ready
+    // starts answering 200.
+    readiness.mark_ready();
     tracing::info!("hoglet listening on {addr}");
 
-    axum::serve(listener, hoglet::app_with_state(state))
+    axum::serve(listener, hoglet::app_with_state(state, readiness))
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
         })

@@ -25,18 +25,25 @@ use capture::CaptureState;
 /// CORS is maximally permissive by contract (compat-spec.md "Responses"):
 /// old SDKs and reverse proxies send funky headers, and analytics endpoints
 /// are public by nature.
-pub fn app_with_state(state: CaptureState) -> Router {
+pub fn app_with_state(state: CaptureState, readiness: routes::health::Readiness) -> Router {
     Router::new()
         .merge(routes::config::router())
         .merge(routes::flags::router())
+        .merge(routes::health::router(readiness))
         .merge(capture::router(state))
         .layer(CorsLayer::very_permissive())
 }
 
-/// Default app: log sink, in-memory identity. For tests and dry runs.
+/// Default app: log sink, in-memory identity, immediately ready. For tests
+/// and dry runs.
 pub fn app() -> Router {
-    app_with_state(CaptureState {
-        sink: Arc::new(sink::LogSink),
-        identity: Arc::new(identity::IdentityStore::in_memory().expect("in-memory sqlite")),
-    })
+    let readiness = routes::health::Readiness::new();
+    readiness.mark_ready();
+    app_with_state(
+        CaptureState {
+            sink: Arc::new(sink::LogSink),
+            identity: Arc::new(identity::IdentityStore::in_memory().expect("in-memory sqlite")),
+        },
+        readiness,
+    )
 }

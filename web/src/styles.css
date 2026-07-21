@@ -1,0 +1,65 @@
+  :root {
+    --bg: #0b0d10; --panel: #14181d; --panel2: #1a1f26; --line: #232a31;
+    --fg: #e6edf3; --dim: #8b98a5; --accent: #ffb454; --good: #3fb950;
+    --blue: #58a6ff; --purple: #bc8cff;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 24px; border-bottom: 1px solid var(--line);
+  }
+  header .hog { font-size: 22px; }
+  header h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  header .tag { color: var(--dim); font-size: 12px; }
+  header input {
+    margin-left: auto; background: var(--panel); border: 1px solid var(--line);
+    color: var(--fg); padding: 6px 10px; border-radius: 6px; font: inherit; width: 200px;
+  }
+  nav { display: flex; gap: 4px; padding: 0 24px; border-bottom: 1px solid var(--line); background: var(--bg); }
+  nav button {
+    background: none; border: none; color: var(--dim); font: inherit; font-size: 13px;
+    padding: 12px 16px; cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  nav button:hover { color: var(--fg); }
+  nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  .card .label { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .value { font-size: 30px; font-weight: 700; margin-top: 6px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cards { grid-template-columns: repeat(2,1fr); } .grid2 { grid-template-columns: 1fr; } }
+  section.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; }
+  section.panel h2 { font-size: 12px; color: var(--dim); margin: 0 0 14px; text-transform: uppercase; letter-spacing: .05em; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .row:last-child { border-bottom: none; }
+  .row .n { color: var(--accent); }
+  .bar-wrap { flex: 1; margin: 0 12px; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar { height: 100%; background: var(--accent); border-radius: 4px; }
+  .ev { font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
+  .ev .name { color: var(--good); }
+  .ev .did { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev .ts { color: var(--dim); margin-left: auto; white-space: nowrap; }
+  .empty { color: var(--dim); font-size: 13px; padding: 8px 0; }
+  .controls { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .controls input, .controls select, .controls button {
+    background: var(--panel2); border: 1px solid var(--line); color: var(--fg);
+    padding: 6px 10px; border-radius: 6px; font: inherit; font-size: 13px;
+  }
+  .controls button { cursor: pointer; color: var(--accent); }
+  .funnel-step { margin-bottom: 12px; }
+  .funnel-step .top { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+  .funnel-step .conv { color: var(--good); }
+  .funnel-step .drop { color: var(--dim); font-size: 11px; }
+  .fbar { height: 30px; background: linear-gradient(90deg, var(--blue), var(--purple)); border-radius: 6px; min-width: 2px; display: flex; align-items: center; padding-left: 10px; font-size: 13px; font-weight: 600; }
+  .flag { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .flag:last-child { border-bottom: none; }
+  .flag .key { font-size: 14px; flex: 1; }
+  .flag .pill { font-size: 11px; padding: 3px 8px; border-radius: 10px; }
+  .flag .on { background: rgba(63,185,80,.15); color: var(--good); }
+  .flag .off { background: rgba(139,152,165,.15); color: var(--dim); }
+  .flag .rollout { color: var(--accent); font-size: 13px; width: 48px; text-align: right; }
+  svg text { fill: var(--dim); font-size: 10px; }
+  footer { color: var(--dim); font-size: 11px; text-align: center; padding: 24px; }

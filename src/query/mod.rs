@@ -18,6 +18,7 @@ use std::sync::Arc;
 use duckdb::Connection;
 use serde::Serialize;
 use tokio::sync::Semaphore;
+use ts_rs::TS;
 
 /// Hard cap on funnel steps — bounded query cost.
 pub const MAX_FUNNEL_STEPS: usize = 12;
@@ -37,32 +38,43 @@ pub struct QueryEngine {
     permits: Arc<Semaphore>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct Stats {
+    #[ts(type = "number")]
     pub total_events: i64,
+    #[ts(type = "number")]
     pub unique_persons: i64,
+    #[ts(type = "number")]
     pub events_24h: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct TrendPoint {
     pub day: String,
+    #[ts(type = "number")]
     pub count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct EventCount {
     pub event: String,
+    #[ts(type = "number")]
     pub count: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct FunnelStep {
     pub event: String,
+    #[ts(type = "number")]
     pub reached: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct RecentEvent {
     pub uuid: String,
     pub event: String,

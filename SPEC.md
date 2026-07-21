@@ -102,15 +102,16 @@ SDK ─HTTP─▶ capture ─▶ WAL (fsync) ─ack▶ 2xx
 6. **Flush.** `flush.rs` — every 5s: seal WAL segment → write Parquet →
    delete segment → compact. Parquet durable *before* segment delete.
 
-## Data flow — query ◐
+## Data flow — query ✅
 
 DuckDB opens Parquet segments **read-only** as a query engine (never a live
 `.duckdb` file — `stack.md`), uuid-deduped so counts are honest. Built:
-stats, trend, top-events, funnel (CTE-chain, order-respecting), recent. The
-dashboard (`dashboard/index.html`, embedded via `include_str!`) polls the
-`/api/*` endpoints. Still ○: `LEAD IGNORE NULLS` / custom Rust funnel operator
-for scale, retention/cohort views, a real React build via `rust-embed`+`ts-rs`,
-and the query-semantics oracle (`decisions.md`).
+stats, trend, top-events, funnel (CTE-chain, order-respecting), recent, each
+cross-checked against an independent Rust oracle (`query/oracle.rs`). The
+dashboard is a React + TS app (`web/`, types generated from the Rust API structs
+by ts-rs) built by Vite and embedded via `rust-embed`, polling `/api/*`. Still
+○ at scale: a `LEAD IGNORE NULLS` / custom Rust funnel operator, and the
+real-PostHog query-semantics oracle (needs a PostHog deployment).
 
 ## Data model
 
@@ -281,13 +282,13 @@ the boundary where someone experiences them (`claims.md`). Current status:
 - **M1 — a real app works ✅.** Config, capture+decompression, WAL,
   Parquet+compactor, flags shapes, identity, SDK contract harness. 72 tests +
   SIGKILL + node contract test green.
-- **M2 — usable product ✅ (~97%).** Query layer (stats/trend/top/funnel over
-  DuckDB) with lane isolation and a Rust cross-check oracle; four-tab embedded
-  dashboard; project/token registry + admin API; flags with variants +
+- **M2 — usable product ✅ (~99%).** Query layer (stats/trend/top/funnel over
+  DuckDB) with lane isolation and a Rust cross-check oracle; a real React + TS
+  dashboard (Vite build, types generated from Rust by ts-rs, embedded via
+  rust-embed); project/token registry + admin API; flags with variants +
   conditions (PostHog SHA1 bucketing); readiness; per-token rate limiting;
   retention; format versioning; GDPR erasure; `/metrics`; local load test.
-  Remaining: a real React build (the inline dashboard works) and the published
-  1 GB-box benchmark (needs the real hardware) — both noted below.
+  Only remaining item is the published 1 GB-box benchmark (needs real hardware).
 - **M3 — launch ○.** One-curl install, demo, measured benchmark, Show HN.
 
 Scope ladder (`CLAUDE.md`): now = client+server events, identity, flags; later =

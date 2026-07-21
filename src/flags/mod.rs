@@ -27,7 +27,8 @@ const LONG_SCALE: f64 = 0xfff_ffff_ffff_ffff_u64 as f64;
 
 /// One variant of a multivariate flag. `rollout` values across a flag's
 /// variants are cumulative buckets summing to ~100.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct Variant {
     pub key: String,
     pub rollout: f64,
@@ -59,7 +60,8 @@ pub struct EvaluatedFlag {
     pub variant: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
+#[ts(export, export_to = "../web/src/types/")]
 pub struct FlagDef {
     pub key: String,
     pub active: bool,

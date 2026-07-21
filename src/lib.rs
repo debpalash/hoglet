@@ -53,6 +53,7 @@ pub fn app_with_state(
         .merge(routes::flags::router(flag_store))
         .merge(routes::health::router(readiness))
         .merge(routes::metrics::router(metrics))
+        .merge(routes::docs::router())
         .merge(routes::api::router(engine))
         .merge(routes::admin::router(admin))
         .merge(capture::router(state))

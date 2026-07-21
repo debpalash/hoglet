@@ -11,15 +11,28 @@
 //! compatibility lives at the ingest edge, analytics behind it.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use duckdb::Connection;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 
 /// Hard cap on funnel steps — bounded query cost.
 pub const MAX_FUNNEL_STEPS: usize = 12;
 
+/// DuckDB memory ceiling per query. The query lane must never OOM the process
+/// the ingest lane lives in (SPEC.md two-lanes invariant); DuckDB spills to
+/// disk past this instead of allocating without bound.
+pub const QUERY_MEMORY_LIMIT: &str = "256MB";
+
+/// Max concurrent DuckDB queries. Beyond this, callers wait — analytical load
+/// is capped so it can't starve ingest.
+pub const MAX_CONCURRENT_QUERIES: usize = 4;
+
 pub struct QueryEngine {
     events_dir: PathBuf,
+    /// Bounds in-flight queries; the query lane's concurrency cap.
+    permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,7 +82,20 @@ impl From<duckdb::Error> for QueryError {
 
 impl QueryEngine {
     pub fn new(events_dir: PathBuf) -> Self {
-        Self { events_dir }
+        Self {
+            events_dir,
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+        }
+    }
+
+    /// Acquire a query permit (the concurrency cap). Held for the call's
+    /// duration; dropped on return.
+    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("query semaphore never closed")
     }
 
     /// Glob of Parquet segments. Empty when nothing has flushed yet.
@@ -84,7 +110,11 @@ impl QueryEngine {
     }
 
     fn conn(&self) -> Result<Connection, QueryError> {
-        Ok(Connection::open_in_memory()?)
+        let conn = Connection::open_in_memory()?;
+        // Cap memory so a heavy scan spills to disk rather than OOMing the
+        // process the ingest lane shares.
+        conn.execute_batch(&format!("SET memory_limit='{QUERY_MEMORY_LIMIT}';"))?;
+        Ok(conn)
     }
 
     /// `read_parquet(glob)` deduped to one row per uuid. Callers wrap this as

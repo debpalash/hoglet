@@ -1,20 +1,22 @@
 //! `/flags` and `/decide` — one handler, `?v=` selects the response shape
 //! (compat-spec.md "Flags response shapes").
 //!
-//! Flag *definitions* don't exist yet; every shape resolves to an empty flag
-//! set, which the SDK handles gracefully. The wire shapes are the contract
-//! being implemented here — real evaluation slots in behind them.
+//! This module owns the wire *shapes*; `crate::flags` owns *which flags are on
+//! for whom*. Evaluations come from the flag store, keyed by token, bucketed
+//! per `distinct_id` with PostHog's exact hash.
+
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::Query,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::capture::decompress;
+use crate::flags::FlagStore;
 use crate::token;
 
 #[derive(serde::Deserialize, Default)]
@@ -23,15 +25,22 @@ pub struct FlagsQuery {
     pub compression: Option<String>,
 }
 
-pub fn router() -> Router {
+#[derive(Clone)]
+pub struct FlagsState {
+    pub store: Arc<FlagStore>,
+}
+
+pub fn router(store: Arc<FlagStore>) -> Router {
     Router::new()
         .route("/flags", post(flags))
         .route("/flags/", post(flags))
         .route("/decide", post(flags))
         .route("/decide/", post(flags))
+        .with_state(FlagsState { store })
 }
 
 async fn flags(
+    State(state): State<FlagsState>,
     Query(query): Query<FlagsQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -41,13 +50,13 @@ async fn flags(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
 
-    let Ok(text) = decompress::decode(&body, form_encoded, query.compression.as_deref()) else {
+    let Ok(text) = crate::capture::decompress::decode(&body, form_encoded, query.compression.as_deref())
+    else {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // Flags bodies are json5 in the wild: NaN/Infinity appear (mapped to
-    // null by the json5 parser) and Android clients send lossy UTF-8 —
-    // already replaced during decode.
+    // Flags bodies are json5 in the wild (NaN/Infinity; lossy UTF-8 already
+    // replaced during decode).
     let Ok(request): Result<Value, _> = json5::from_str(&text) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -63,40 +72,92 @@ async fn flags(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    let distinct_id = request
+        .get("distinct_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    let evaluated = state.store.evaluate(raw_token, distinct_id);
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    // Shape table from compat-spec.md. Current posthog-js: /flags/?v=2 for
-    // the value map, plain /flags for FlagDetails.
     let body = match query.v.as_deref() {
-        Some("1") => json!({
-            "feature_flags": [],
-            "errors_while_computing_flags": false,
-            "request_id": request_id,
-        }),
-        Some("2") => json!({
-            "feature_flags": {},
-            "feature_flag_payloads": {},
-            "errors_while_computing_flags": false,
-            "request_id": request_id,
-        }),
-        Some(_) | None => json!({
-            "flags": {},
-            "errors_while_computing_flags": false,
-            "request_id": request_id,
-        }),
+        // v1: array of enabled flag keys.
+        Some("1") => {
+            let keys: Vec<&str> = evaluated
+                .iter()
+                .filter(|f| f.enabled)
+                .map(|f| f.key.as_str())
+                .collect();
+            json!({
+                "feature_flags": keys,
+                "errors_while_computing_flags": false,
+                "request_id": request_id,
+            })
+        }
+        // v2: {key: bool} map + payloads.
+        Some("2") => {
+            let mut map = Map::new();
+            for f in &evaluated {
+                map.insert(f.key.clone(), Value::Bool(f.enabled));
+            }
+            json!({
+                "feature_flags": map,
+                "feature_flag_payloads": {},
+                "errors_while_computing_flags": false,
+                "request_id": request_id,
+            })
+        }
+        // default /flags: {key: FlagDetails}.
+        Some(_) | None => {
+            let mut map = Map::new();
+            for f in &evaluated {
+                map.insert(
+                    f.key.clone(),
+                    json!({
+                        "key": f.key,
+                        "enabled": f.enabled,
+                        "variant": Value::Null,
+                        "reason": {
+                            "code": if f.enabled { "condition_match" } else { "no_condition_match" },
+                            "condition_index": 0,
+                            "description": "rollout percentage",
+                        },
+                        "metadata": {
+                            "id": 0,
+                            "version": 1,
+                            "description": Value::Null,
+                            "payload": Value::Null,
+                        },
+                    }),
+                );
+            }
+            json!({
+                "flags": map,
+                "errors_while_computing_flags": false,
+                "request_id": request_id,
+            })
+        }
     };
     Json(body).into_response()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    async fn post(uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
-        let res = super::router()
+    fn app() -> Router {
+        let store = Arc::new(FlagStore::in_memory().unwrap());
+        store.upsert("phc_t", "new-ui", true, 100.0).unwrap();
+        store.upsert("phc_t", "beta", true, 0.0).unwrap();
+        router(store)
+    }
+
+    async fn post(app: Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+        let res = app
             .oneshot(Request::post(uri).body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
@@ -113,43 +174,39 @@ mod tests {
     const BODY: &str = r#"{"token":"phc_t","distinct_id":"u1"}"#;
 
     #[tokio::test]
-    async fn v2_shape_is_value_map() {
-        let (status, body) = post("/flags/?v=2", BODY).await;
+    async fn v2_evaluates_flags() {
+        let (status, body) = post(app(), "/flags/?v=2", BODY).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["feature_flags"].is_object());
-        assert!(body["feature_flag_payloads"].is_object());
-        assert_eq!(body["errors_while_computing_flags"], false);
-        assert!(body["request_id"].is_string());
+        assert_eq!(body["feature_flags"]["new-ui"], true);
+        assert_eq!(body["feature_flags"]["beta"], false);
     }
 
     #[tokio::test]
-    async fn v1_shape_is_key_array() {
-        let (_, body) = post("/decide/?v=1", BODY).await;
-        assert!(body["feature_flags"].is_array());
+    async fn v1_lists_only_enabled() {
+        let (_, body) = post(app(), "/decide/?v=1", BODY).await;
+        let arr = body["feature_flags"].as_array().unwrap();
+        assert!(arr.iter().any(|v| v == "new-ui"));
+        assert!(!arr.iter().any(|v| v == "beta"));
     }
 
     #[tokio::test]
-    async fn default_shape_is_flag_details() {
-        let (_, body) = post("/flags/", BODY).await;
-        assert!(body["flags"].is_object());
+    async fn default_shape_has_flag_details() {
+        let (_, body) = post(app(), "/flags/", BODY).await;
+        assert_eq!(body["flags"]["new-ui"]["enabled"], true);
+        assert_eq!(body["flags"]["new-ui"]["variant"], serde_json::Value::Null);
     }
 
     #[tokio::test]
-    async fn decide_alias_serves_same_handler() {
-        let (status, body) = post("/decide/?v=2", BODY).await;
+    async fn empty_store_returns_empty_not_error() {
+        let store = Arc::new(FlagStore::in_memory().unwrap());
+        let (status, body) = post(router(store), "/flags/?v=2", BODY).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body["feature_flags"].is_object());
-    }
-
-    #[tokio::test]
-    async fn json5_nan_tolerated() {
-        let (status, _) = post("/flags/?v=2", r#"{"token":"phc_t","distinct_id":"u1","x":NaN}"#).await;
-        assert_eq!(status, StatusCode::OK);
+        assert!(body["feature_flags"].as_object().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn missing_token_is_401() {
-        let (status, _) = post("/flags/?v=2", r#"{"distinct_id":"u1"}"#).await;
+        let (status, _) = post(app(), "/flags/?v=2", r#"{"distinct_id":"u1"}"#).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 }

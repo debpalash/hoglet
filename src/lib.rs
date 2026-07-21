@@ -5,6 +5,7 @@
 //! byte-for-byte — anything custom stays behind it.
 
 pub mod capture;
+pub mod flags;
 pub mod flush;
 pub mod identity;
 pub mod query;
@@ -32,11 +33,12 @@ pub fn app_with_state(
     state: CaptureState,
     readiness: routes::health::Readiness,
     engine: Arc<query::QueryEngine>,
+    flag_store: Arc<flags::FlagStore>,
 ) -> Router {
     Router::new()
         .merge(routes::dashboard::router())
         .merge(routes::config::router())
-        .merge(routes::flags::router())
+        .merge(routes::flags::router(flag_store))
         .merge(routes::health::router(readiness))
         .merge(routes::api::router(engine))
         .merge(capture::router(state))
@@ -59,5 +61,6 @@ pub fn app() -> Router {
         Arc::new(query::QueryEngine::new(std::path::PathBuf::from(
             "/nonexistent-hoglet-events",
         ))),
+        Arc::new(flags::FlagStore::in_memory().expect("in-memory sqlite")),
     )
 }

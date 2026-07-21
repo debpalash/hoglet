@@ -1,9 +1,10 @@
 //! Dashboard query API (SPEC.md "query lane"). Internal JSON, not a
 //! PostHog-compatible surface — the dashboard is ours to shape.
 //!
-//! Every endpoint is read-only over the Parquet store via [`QueryEngine`].
-//! Failures return 500 with no body; an empty store returns empty results,
-//! never an error.
+//! Every query acquires a permit (the query-lane concurrency cap) and runs on
+//! a blocking thread, so analytical load never starves the async ingest
+//! runtime. Failures return 500 with no body; an empty store returns empty
+//! results, never an error.
 
 use std::sync::Arc;
 
@@ -14,9 +15,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::query::QueryEngine;
+use crate::query::{QueryEngine, QueryError};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -33,8 +34,19 @@ pub fn router(engine: Arc<QueryEngine>) -> Router {
         .with_state(ApiState { engine })
 }
 
-fn err<T>(_: T) -> Response {
-    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+/// Run a query under the concurrency cap, off the async runtime.
+async fn run<T, F>(state: &ApiState, f: F) -> Response
+where
+    F: FnOnce(&QueryEngine) -> Result<T, QueryError> + Send + 'static,
+    T: Serialize + Send + 'static,
+{
+    let _permit = state.engine.acquire().await;
+    let engine = state.engine.clone();
+    match tokio::task::spawn_blocking(move || f(&engine)).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(QueryError::TooManySteps)) => StatusCode::BAD_REQUEST.into_response(),
+        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -43,10 +55,7 @@ struct TokenQuery {
 }
 
 async fn stats(State(s): State<ApiState>, Query(q): Query<TokenQuery>) -> Response {
-    match s.engine.stats(&q.token) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(e),
-    }
+    run(&s, move |e| e.stats(&q.token)).await
 }
 
 #[derive(Deserialize)]
@@ -60,10 +69,7 @@ fn default_limit() -> usize {
 }
 
 async fn top_events(State(s): State<ApiState>, Query(q): Query<TopQuery>) -> Response {
-    match s.engine.top_events(&q.token, q.limit.min(100)) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(e),
-    }
+    run(&s, move |e| e.top_events(&q.token, q.limit.min(100))).await
 }
 
 #[derive(Deserialize)]
@@ -78,10 +84,7 @@ fn default_days() -> u32 {
 }
 
 async fn trend(State(s): State<ApiState>, Query(q): Query<TrendQuery>) -> Response {
-    match s.engine.trend(&q.token, &q.event, q.days.min(365)) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(e),
-    }
+    run(&s, move |e| e.trend(&q.token, &q.event, q.days.min(365))).await
 }
 
 #[derive(Deserialize)]
@@ -91,16 +94,9 @@ struct FunnelBody {
 }
 
 async fn funnel(State(s): State<ApiState>, Json(b): Json<FunnelBody>) -> Response {
-    match s.engine.funnel(&b.token, &b.steps) {
-        Ok(v) => Json(v).into_response(),
-        Err(crate::query::QueryError::TooManySteps) => StatusCode::BAD_REQUEST.into_response(),
-        Err(e) => err(e),
-    }
+    run(&s, move |e| e.funnel(&b.token, &b.steps)).await
 }
 
 async fn recent(State(s): State<ApiState>, Query(q): Query<TopQuery>) -> Response {
-    match s.engine.recent_events(&q.token, q.limit.min(200)) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => err(e),
-    }
+    run(&s, move |e| e.recent_events(&q.token, q.limit.min(200))).await
 }

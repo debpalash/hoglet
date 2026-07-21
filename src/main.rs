@@ -55,6 +55,12 @@ async fn main() {
         limiter: std::sync::Arc::new(hoglet::ratelimit::RateLimiter::new(max_per_sec)),
     };
     let engine = std::sync::Arc::new(hoglet::query::QueryEngine::new(data_dir.join("events")));
+    let flag_store = std::sync::Arc::new(
+        hoglet::flags::FlagStore::open(
+            rusqlite::Connection::open(data_dir.join("flags.db")).expect("cannot open flags db"),
+        )
+        .expect("cannot init flag store"),
+    );
 
     let readiness = hoglet::routes::health::Readiness::new();
 
@@ -66,7 +72,10 @@ async fn main() {
     readiness.mark_ready();
     tracing::info!("hoglet listening on {addr}");
 
-    axum::serve(listener, hoglet::app_with_state(state, readiness, engine))
+    axum::serve(
+        listener,
+        hoglet::app_with_state(state, readiness, engine, flag_store),
+    )
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();
         })

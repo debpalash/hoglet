@@ -58,7 +58,9 @@ Nothing here is proven until its evidence exists. Until then, do not make the cl
 
 **Distinguishing success from a plausible imitation:** "it compiled to one binary" proves nothing about runtime footprint. The number that matters is RSS under load, measured, not idle memory at startup.
 
-**Outside the claim:** any specific throughput figure. We do not publish an events-per-second number until we have measured one on stated hardware.
+**Measured locally (not the published number):** via `scripts/loadtest.sh` on a dev machine (not the 1 GB VPS), with a query racing ingest: peak RSS ~146 MB across 200k events at 64 concurrent connections; throughput ~10k events/s at 64 conns, ~1.5k at 8 (fsync/group-commit bound — scales with concurrency, exactly as designed). These clear the SPEC targets (<400 MB, ≥5k/s) but are dev-box numbers. The published claim still requires the stated 1 vCPU / 1 GB hardware.
+
+**Outside the claim:** any specific *published* throughput figure. We do not publish an events-per-second number until we have measured one on the stated hardware.
 
 ---
 

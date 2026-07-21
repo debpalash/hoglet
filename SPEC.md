@@ -268,7 +268,7 @@ the boundary where someone experiences them (`claims.md`). Current status:
 |---|---|---|
 | 1 — stock SDKs work unchanged | real posthog-node latest → real binary, asserts persisted bytes | ✅ node passing; browser (Playwright) ◐ scaffolded |
 | 2 — we do not lose events | SIGKILL the running binary, reconcile acked vs recovered | ✅ passing |
-| 3 — one binary, `$5` VPS | measured RSS under concurrent query+ingest on 1 GB box | ○ not measured — no number published until it is |
+| 3 — one binary, `$5` VPS | measured RSS under concurrent query+ingest | ◐ dev-box: ~146 MB RSS, ~10k ev/s @64 conns (clears targets); 1 GB-box number still ○ |
 | 4 — honest person counts | permute merge order, assert convergence | ✅ 6/6 permutations converge |
 
 ## Milestones

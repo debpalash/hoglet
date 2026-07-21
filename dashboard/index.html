@@ -208,11 +208,13 @@ async function runTrend() {
 async function refreshFlags() {
   const data = await j(`/api/flags?token=${token()}`);
   if (!data) return;
-  $("flags").innerHTML = data.length ? data.map(f =>
-    `<div class="flag"><span class="key">${esc(f.key)}</span>
+  $("flags").innerHTML = data.length ? data.map(f => {
+    const variants = (f.variants && f.variants.length)
+      ? `<span class="did">${f.variants.map(v => `${esc(v.key)} ${v.rollout}%`).join(" · ")}</span>` : "";
+    return `<div class="flag"><span class="key">${esc(f.key)}${variants?" ":""}${variants}</span>
       <span class="pill ${f.active?'on':'off'}">${f.active?'active':'inactive'}</span>
-      <span class="rollout">${f.rollout_percentage}%</span></div>`
-  ).join("") : `<div class="empty">No flags defined. Create one via the admin API.</div>`;
+      <span class="rollout">${f.rollout_percentage}%</span></div>`;
+  }).join("") : `<div class="empty">No flags defined. Create one via the admin API.</div>`;
 }
 
 function refresh() {

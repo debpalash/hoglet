@@ -91,8 +91,24 @@ async fn flags(
         .and_then(Value::as_str)
         .unwrap_or("");
 
-    let evaluated = state.store.evaluate(raw_token, distinct_id);
+    // PostHog local-eval model: conditions match against person_properties the
+    // SDK passes on the request.
+    let person_properties = request
+        .get("person_properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let evaluated = state.store.evaluate(raw_token, distinct_id, &person_properties);
     let request_id = uuid::Uuid::new_v4().to_string();
+
+    // A flag's value is its variant string when multivariate, else its bool.
+    let flag_value = |f: &crate::flags::EvaluatedFlag| -> Value {
+        match &f.variant {
+            Some(v) if f.enabled => Value::String(v.clone()),
+            _ => Value::Bool(f.enabled),
+        }
+    };
 
     let body = match query.v.as_deref() {
         // v1: array of enabled flag keys.
@@ -108,11 +124,11 @@ async fn flags(
                 "request_id": request_id,
             })
         }
-        // v2: {key: bool} map + payloads.
+        // v2: {key: bool|variant} map + payloads.
         Some("2") => {
             let mut map = Map::new();
             for f in &evaluated {
-                map.insert(f.key.clone(), Value::Bool(f.enabled));
+                map.insert(f.key.clone(), flag_value(f));
             }
             json!({
                 "feature_flags": map,
@@ -130,7 +146,7 @@ async fn flags(
                     json!({
                         "key": f.key,
                         "enabled": f.enabled,
-                        "variant": Value::Null,
+                        "variant": f.variant.clone().map(Value::String).unwrap_or(Value::Null),
                         "reason": {
                             "code": if f.enabled { "condition_match" } else { "no_condition_match" },
                             "condition_index": 0,

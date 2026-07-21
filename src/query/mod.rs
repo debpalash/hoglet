@@ -10,6 +10,8 @@
 //! This is the dashboard's engine, not a PostHog-compatible surface —
 //! compatibility lives at the ingest edge, analytics behind it.
 
+pub mod oracle;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -403,5 +405,60 @@ mod tests {
         let (_d, e) = engine_with(&events);
         let r = e.recent_events("phc_t", 10).unwrap();
         assert_eq!(r[0].event, "new");
+    }
+
+    /// Build a varied, deterministic dataset with duplicate uuids sprinkled in.
+    fn varied_dataset() -> Vec<CapturedEvent> {
+        let names = ["signup", "activate", "purchase", "pageview", "click"];
+        let mut events = Vec::new();
+        for i in 0..400usize {
+            let user = i % 37; // 37 distinct users
+            let name = names[(i * 7) % names.len()];
+            let mut e = ev(name, &format!("u{user}"), (i % 50) as i64);
+            // Deterministic uuid so ~every 13th event duplicates an earlier one.
+            e.uuid = uuid::Uuid::from_u128((i % 380) as u128);
+            events.push(e);
+        }
+        events
+    }
+
+    /// The query-semantics oracle: DuckDB SQL and the independent Rust
+    /// implementation must agree on every question over the same data. A bug
+    /// in either is caught here.
+    #[test]
+    fn duckdb_agrees_with_rust_oracle() {
+        let events = varied_dataset();
+        let (_d, engine) = engine_with(&events);
+
+        // total + persons
+        let stats = engine.stats("phc_t").unwrap();
+        let (o_total, o_persons) = oracle::total_and_persons(&events, "phc_t");
+        assert_eq!(stats.total_events, o_total, "total_events disagree");
+        assert_eq!(stats.unique_persons, o_persons, "unique_persons disagree");
+
+        // top events, compared as a map (tie order is unspecified in SQL)
+        let sql_top: std::collections::HashMap<String, i64> = engine
+            .top_events("phc_t", 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event, e.count))
+            .collect();
+        assert_eq!(sql_top, oracle::top_events(&events, "phc_t"), "top_events disagree");
+
+        // funnels of several shapes
+        for steps in [
+            vec!["signup".to_string(), "activate".to_string(), "purchase".to_string()],
+            vec!["pageview".to_string(), "click".to_string()],
+            vec!["click".to_string(), "signup".to_string(), "activate".to_string()],
+        ] {
+            let sql: Vec<i64> = engine
+                .funnel("phc_t", &steps)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.reached)
+                .collect();
+            let rust = oracle::funnel(&events, "phc_t", &steps);
+            assert_eq!(sql, rust, "funnel {steps:?} disagree: sql={sql:?} rust={rust:?}");
+        }
     }
 }

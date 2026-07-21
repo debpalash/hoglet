@@ -87,6 +87,10 @@ struct UpsertFlag {
     active: bool,
     #[serde(default = "full")]
     rollout_percentage: f64,
+    #[serde(default)]
+    variants: Vec<crate::flags::Variant>,
+    #[serde(default)]
+    conditions: Option<crate::flags::Conditions>,
 }
 fn yes() -> bool {
     true
@@ -104,10 +108,14 @@ async fn upsert_flag(
         return rejection;
     }
     let rollout = body.rollout_percentage.clamp(0.0, 100.0);
-    match state
-        .flags
-        .upsert(&body.token, &body.key, body.active, rollout)
-    {
+    match state.flags.upsert_full(
+        &body.token,
+        &body.key,
+        body.active,
+        rollout,
+        &body.variants,
+        body.conditions.as_ref(),
+    ) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -178,7 +186,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         // The flag is now evaluable.
-        assert!(flags.evaluate("phc_t", "u1")[0].enabled);
+        assert!(flags.evaluate("phc_t", "u1", &serde_json::Map::new())[0].enabled);
     }
 
     #[tokio::test]

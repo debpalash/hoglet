@@ -6,28 +6,65 @@
 //! selects the *same* users on Hoglet as on PostHog — the compatibility that
 //! makes us a true drop-in (`why-hoglet.md`), not just wire-shaped.
 //!
+//! Supports the three things real flags need: **rollout %**, **multivariate
+//! variants** (return a variant string, bucketed consistently), and
+//! **property conditions** matched against the person properties the SDK
+//! passes on the flags request (PostHog's local-evaluation model).
+//!
 //! Definitions live in SQLite, keyed by token. Response *shapes* are owned by
-//! `routes/flags.rs`; this module owns *which flags are on for whom*.
+//! `routes/flags.rs`; this module owns *which flags are on for whom, and which
+//! variant*.
 
 use std::sync::Mutex;
 
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha1::{Digest, Sha1};
 
 /// 60-bit scale: the max value of the first 15 hex chars of the SHA1 digest.
 const LONG_SCALE: f64 = 0xfff_ffff_ffff_ffff_u64 as f64;
 
+/// One variant of a multivariate flag. `rollout` values across a flag's
+/// variants are cumulative buckets summing to ~100.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Variant {
+    pub key: String,
+    pub rollout: f64,
+}
+
+/// A property filter matched against the request's person properties.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropertyFilter {
+    pub key: String,
+    #[serde(default = "op_exact")]
+    pub operator: String,
+    pub value: Value,
+}
+fn op_exact() -> String {
+    "exact".into()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Conditions {
+    #[serde(default)]
+    pub properties: Vec<PropertyFilter>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvaluatedFlag {
     pub key: String,
     pub enabled: bool,
+    /// Some(variant) for a matched multivariate flag; None for a boolean flag.
+    pub variant: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FlagDef {
     pub key: String,
     pub active: bool,
     pub rollout_percentage: f64,
+    pub variants: Vec<Variant>,
 }
 
 pub struct FlagStore {
@@ -40,9 +77,19 @@ CREATE TABLE IF NOT EXISTS feature_flags (
     key TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1,
     rollout_percentage REAL NOT NULL DEFAULT 100.0,
+    variants TEXT,
+    conditions TEXT,
     PRIMARY KEY (token, key)
 );
 ";
+
+/// One row's stored definition.
+struct StoredFlag {
+    key: String,
+    rollout: f64,
+    variants: Vec<Variant>,
+    conditions: Option<Conditions>,
+}
 
 impl FlagStore {
     pub fn open(conn: Connection) -> rusqlite::Result<Self> {
@@ -56,130 +103,369 @@ impl FlagStore {
         Self::open(Connection::open_in_memory()?)
     }
 
+    /// Simple boolean flag (no variants, no conditions).
     pub fn upsert(&self, token: &str, key: &str, active: bool, rollout: f64) -> rusqlite::Result<()> {
+        self.upsert_full(token, key, active, rollout, &[], None)
+    }
+
+    /// Full definition with optional variants and conditions.
+    pub fn upsert_full(
+        &self,
+        token: &str,
+        key: &str,
+        active: bool,
+        rollout: f64,
+        variants: &[Variant],
+        conditions: Option<&Conditions>,
+    ) -> rusqlite::Result<()> {
+        let variants_json = if variants.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(variants).unwrap())
+        };
+        let conditions_json = conditions.map(|c| serde_json::to_string(c).unwrap());
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO feature_flags (token, key, active, rollout_percentage)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(token, key) DO UPDATE SET active=?3, rollout_percentage=?4",
-            params![token, key, active as i64, rollout],
+            "INSERT INTO feature_flags (token, key, active, rollout_percentage, variants, conditions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(token, key) DO UPDATE SET
+                active=?3, rollout_percentage=?4, variants=?5, conditions=?6",
+            params![token, key, active as i64, rollout, variants_json, conditions_json],
         )?;
         Ok(())
     }
 
-    /// List all flag definitions for a token (dashboard view).
-    pub fn list(&self, token: &str) -> Vec<FlagDef> {
+    fn load(&self, token: &str, active_only: bool) -> Vec<StoredFlag> {
         let conn = self.conn.lock().unwrap();
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT key, active, rollout_percentage FROM feature_flags WHERE token=?1 ORDER BY key",
-        ) else {
+        let sql = if active_only {
+            "SELECT key, rollout_percentage, variants, conditions FROM feature_flags WHERE token=?1 AND active=1"
+        } else {
+            "SELECT key, rollout_percentage, variants, conditions FROM feature_flags WHERE token=?1 ORDER BY key"
+        };
+        let Ok(mut stmt) = conn.prepare(sql) else {
             return vec![];
         };
         let rows = stmt.query_map(params![token], |r| {
-            Ok(FlagDef {
+            let variants: Option<String> = r.get(2)?;
+            let conditions: Option<String> = r.get(3)?;
+            Ok(StoredFlag {
                 key: r.get(0)?,
-                active: r.get::<_, i64>(1)? != 0,
-                rollout_percentage: r.get(2)?,
+                rollout: r.get(1)?,
+                variants: variants
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                conditions: conditions.and_then(|s| serde_json::from_str(&s).ok()),
             })
         });
         rows.map(|r| r.flatten().collect()).unwrap_or_default()
     }
 
-    /// Evaluate every active flag for this token against `distinct_id`.
-    pub fn evaluate(&self, token: &str, distinct_id: &str) -> Vec<EvaluatedFlag> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn
-            .prepare("SELECT key, rollout_percentage FROM feature_flags WHERE token=?1 AND active=1")
-        {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let rows = stmt.query_map(params![token], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
-        });
-        let Ok(rows) = rows else { return vec![] };
-        rows.flatten()
-            .map(|(key, rollout)| EvaluatedFlag {
-                enabled: is_enabled(&key, distinct_id, rollout),
-                key,
+    /// List all flag definitions for a token (dashboard view).
+    pub fn list(&self, token: &str) -> Vec<FlagDef> {
+        self.load(token, false)
+            .into_iter()
+            .map(|f| FlagDef {
+                key: f.key,
+                // active_only=false includes inactive; re-read active via a
+                // second lightweight query would be wasteful, so derive from
+                // a fresh load below is avoided — instead we mark active by
+                // whether it appears in the active set.
+                active: true,
+                rollout_percentage: f.rollout,
+                variants: f.variants,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|mut d| {
+                d.active = self.is_active(token, &d.key);
+                d
             })
             .collect()
+    }
+
+    fn is_active(&self, token: &str, key: &str) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT active FROM feature_flags WHERE token=?1 AND key=?2",
+            params![token, key],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|a| a != 0)
+        .unwrap_or(false)
+    }
+
+    /// Evaluate every active flag for this token against `distinct_id` and the
+    /// person properties the SDK passed on the request.
+    pub fn evaluate(
+        &self,
+        token: &str,
+        distinct_id: &str,
+        person_properties: &Map<String, Value>,
+    ) -> Vec<EvaluatedFlag> {
+        self.load(token, true)
+            .into_iter()
+            .map(|f| evaluate_one(&f, distinct_id, person_properties))
+            .collect()
+    }
+}
+
+fn evaluate_one(
+    f: &StoredFlag,
+    distinct_id: &str,
+    person_properties: &Map<String, Value>,
+) -> EvaluatedFlag {
+    // Conditions gate first: if any property filter fails, the flag is off.
+    if let Some(cond) = &f.conditions
+        && !cond
+            .properties
+            .iter()
+            .all(|p| match_filter(person_properties.get(&p.key), &p.operator, &p.value))
+    {
+        return EvaluatedFlag {
+            key: f.key.clone(),
+            enabled: false,
+            variant: None,
+        };
+    }
+
+    if !in_rollout(&f.key, distinct_id, f.rollout) {
+        return EvaluatedFlag {
+            key: f.key.clone(),
+            enabled: false,
+            variant: None,
+        };
+    }
+
+    // In rollout. Pick a variant if the flag is multivariate.
+    let variant = if f.variants.is_empty() {
+        None
+    } else {
+        Some(pick_variant(&f.key, distinct_id, &f.variants))
+    };
+    EvaluatedFlag {
+        key: f.key.clone(),
+        enabled: true,
+        variant,
     }
 }
 
 /// PostHog's consistent-hash bucketing. A user's fraction is stable across
 /// calls, so raising the rollout only ever adds users, never reshuffles them.
-fn hash_fraction(key: &str, distinct_id: &str) -> f64 {
+fn hash_fraction(key: &str, distinct_id: &str, salt: &str) -> f64 {
     let mut hasher = Sha1::new();
-    hasher.update(format!("{key}.{distinct_id}").as_bytes());
+    hasher.update(format!("{key}.{distinct_id}{salt}").as_bytes());
     let digest = hasher.finalize();
     let hex = hex::encode(digest);
-    let first15 = &hex[..15];
-    let val = u64::from_str_radix(first15, 16).unwrap_or(0);
+    let val = u64::from_str_radix(&hex[..15], 16).unwrap_or(0);
     val as f64 / LONG_SCALE
 }
 
-fn is_enabled(key: &str, distinct_id: &str, rollout_percentage: f64) -> bool {
+fn in_rollout(key: &str, distinct_id: &str, rollout_percentage: f64) -> bool {
     if rollout_percentage >= 100.0 {
         return true;
     }
     if rollout_percentage <= 0.0 {
         return false;
     }
-    hash_fraction(key, distinct_id) <= rollout_percentage / 100.0
+    hash_fraction(key, distinct_id, "") <= rollout_percentage / 100.0
+}
+
+/// Assign a variant by consistent hash into cumulative rollout ranges
+/// (PostHog uses a distinct "variant" salt so variant choice is independent of
+/// the enabled roll).
+fn pick_variant(key: &str, distinct_id: &str, variants: &[Variant]) -> String {
+    let frac = hash_fraction(key, distinct_id, "variant") * 100.0;
+    let mut cumulative = 0.0;
+    for v in variants {
+        cumulative += v.rollout;
+        if frac < cumulative {
+            return v.key.clone();
+        }
+    }
+    // Rounding slack: fall back to the last variant.
+    variants.last().map(|v| v.key.clone()).unwrap_or_default()
+}
+
+fn match_filter(prop: Option<&Value>, operator: &str, expected: &Value) -> bool {
+    let Some(prop) = prop else {
+        // Missing property matches only "is_not" against a present value.
+        return operator == "is_not";
+    };
+    match operator {
+        "exact" => prop == expected,
+        "is_not" => prop != expected,
+        "icontains" => {
+            let (Some(a), Some(b)) = (prop.as_str(), expected.as_str()) else {
+                return false;
+            };
+            a.to_lowercase().contains(&b.to_lowercase())
+        }
+        "gt" => num(prop).zip(num(expected)).is_some_and(|(a, b)| a > b),
+        "lt" => num(prop).zip(num(expected)).is_some_and(|(a, b)| a < b),
+        _ => false,
+    }
+}
+
+fn num(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn props(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+    fn eval(s: &FlagStore, did: &str) -> Vec<EvaluatedFlag> {
+        s.evaluate("phc_t", did, &Map::new())
+    }
 
     #[test]
     fn full_rollout_always_on() {
         let s = FlagStore::in_memory().unwrap();
         s.upsert("phc_t", "new-ui", true, 100.0).unwrap();
-        let flags = s.evaluate("phc_t", "anyone");
-        assert_eq!(flags, vec![EvaluatedFlag { key: "new-ui".into(), enabled: true }]);
+        assert_eq!(
+            eval(&s, "anyone"),
+            vec![EvaluatedFlag { key: "new-ui".into(), enabled: true, variant: None }]
+        );
     }
 
     #[test]
     fn zero_rollout_always_off() {
         let s = FlagStore::in_memory().unwrap();
         s.upsert("phc_t", "off", true, 0.0).unwrap();
-        assert!(!s.evaluate("phc_t", "anyone")[0].enabled);
+        assert!(!eval(&s, "anyone")[0].enabled);
     }
 
     #[test]
     fn inactive_flags_excluded() {
         let s = FlagStore::in_memory().unwrap();
         s.upsert("phc_t", "dead", false, 100.0).unwrap();
-        assert!(s.evaluate("phc_t", "u").is_empty());
+        assert!(eval(&s, "u").is_empty());
     }
 
     #[test]
-    fn bucketing_is_consistent_per_user() {
-        // Same user, same flag → same answer every time.
-        let a = is_enabled("flag", "user-42", 50.0);
-        let b = is_enabled("flag", "user-42", 50.0);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn raising_rollout_only_adds_users() {
-        // A user enabled at 30% must still be enabled at 60% (monotonic).
-        let users: Vec<String> = (0..500).map(|i| format!("u{i}")).collect();
-        for u in &users {
-            if is_enabled("f", u, 30.0) {
-                assert!(is_enabled("f", u, 60.0), "user {u} dropped when rollout rose");
+    fn bucketing_is_consistent_and_monotonic() {
+        for i in 0..500 {
+            let u = format!("u{i}");
+            if in_rollout("f", &u, 30.0) {
+                assert!(in_rollout("f", &u, 60.0), "user {u} dropped when rollout rose");
             }
         }
     }
 
     #[test]
-    fn rollout_fraction_is_roughly_accurate() {
-        // ~50% of many users enabled at 50% rollout (statistical, wide bound).
+    fn rollout_fraction_roughly_accurate() {
         let n = 2000;
-        let on = (0..n).filter(|i| is_enabled("f", &format!("u{i}"), 50.0)).count();
-        let frac = on as f64 / n as f64;
-        assert!((0.42..0.58).contains(&frac), "got {frac}");
+        let on = (0..n).filter(|i| in_rollout("f", &format!("u{i}"), 50.0)).count();
+        assert!((0.42..0.58).contains(&(on as f64 / n as f64)));
+    }
+
+    #[test]
+    fn multivariate_returns_a_variant() {
+        let s = FlagStore::in_memory().unwrap();
+        s.upsert_full(
+            "phc_t",
+            "exp",
+            true,
+            100.0,
+            &[
+                Variant { key: "control".into(), rollout: 50.0 },
+                Variant { key: "test".into(), rollout: 50.0 },
+            ],
+            None,
+        )
+        .unwrap();
+        let f = &eval(&s, "user-1")[0];
+        assert!(f.enabled);
+        assert!(matches!(f.variant.as_deref(), Some("control") | Some("test")));
+    }
+
+    #[test]
+    fn variant_split_is_roughly_even() {
+        let s = FlagStore::in_memory().unwrap();
+        s.upsert_full(
+            "phc_t",
+            "exp",
+            true,
+            100.0,
+            &[
+                Variant { key: "a".into(), rollout: 50.0 },
+                Variant { key: "b".into(), rollout: 50.0 },
+            ],
+            None,
+        )
+        .unwrap();
+        let mut a = 0;
+        for i in 0..2000 {
+            if eval(&s, &format!("u{i}"))[0].variant.as_deref() == Some("a") {
+                a += 1;
+            }
+        }
+        assert!((0.42..0.58).contains(&(a as f64 / 2000.0)), "split {a}/2000");
+    }
+
+    #[test]
+    fn condition_gates_on_person_property() {
+        let s = FlagStore::in_memory().unwrap();
+        s.upsert_full(
+            "phc_t",
+            "pro-only",
+            true,
+            100.0,
+            &[],
+            Some(&Conditions {
+                properties: vec![PropertyFilter {
+                    key: "plan".into(),
+                    operator: "exact".into(),
+                    value: json!("pro"),
+                }],
+            }),
+        )
+        .unwrap();
+        // pro user: on. free user: off.
+        let pro = s.evaluate("phc_t", "u", &props(json!({"plan": "pro"})));
+        assert!(pro[0].enabled);
+        let free = s.evaluate("phc_t", "u", &props(json!({"plan": "free"})));
+        assert!(!free[0].enabled);
+        // missing property: off.
+        let none = s.evaluate("phc_t", "u", &Map::new());
+        assert!(!none[0].enabled);
+    }
+
+    #[test]
+    fn numeric_gt_condition() {
+        let s = FlagStore::in_memory().unwrap();
+        s.upsert_full(
+            "phc_t",
+            "whales",
+            true,
+            100.0,
+            &[],
+            Some(&Conditions {
+                properties: vec![PropertyFilter {
+                    key: "spend".into(),
+                    operator: "gt".into(),
+                    value: json!(100),
+                }],
+            }),
+        )
+        .unwrap();
+        assert!(s.evaluate("phc_t", "u", &props(json!({"spend": 500})))[0].enabled);
+        assert!(!s.evaluate("phc_t", "u", &props(json!({"spend": 50})))[0].enabled);
+    }
+
+    #[test]
+    fn list_reports_variants_and_active() {
+        let s = FlagStore::in_memory().unwrap();
+        s.upsert("phc_t", "b", false, 25.0).unwrap();
+        s.upsert_full("phc_t", "a", true, 100.0, &[Variant { key: "x".into(), rollout: 100.0 }], None).unwrap();
+        let list = s.list("phc_t");
+        let a = list.iter().find(|f| f.key == "a").unwrap();
+        assert!(a.active && a.variants.len() == 1);
+        let b = list.iter().find(|f| f.key == "b").unwrap();
+        assert!(!b.active && b.rollout_percentage == 25.0);
     }
 }

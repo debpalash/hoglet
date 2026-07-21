@@ -1,1 +1,24 @@
+# Rust build output
 /target
+
+# Hoglet runtime data — WAL, Parquet segments, SQLite. Never commit these;
+# the binary writes here when run from the repo root (default HOGLET_DATA).
+/hoglet-data/
+# Same artifacts if a data dir is pointed anywhere inside the tree.
+*.wal
+*.parquet
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+
+# Editors / IDEs
+/.vscode/
+/.idea/
+*.swp
+
+# Local env overrides
+.env
+.env.local

@@ -8,6 +8,14 @@ import type { TrendPoint } from "./types/TrendPoint";
 import type { FunnelStep } from "./types/FunnelStep";
 import type { RecentEvent } from "./types/RecentEvent";
 import type { FlagDef } from "./types/FlagDef";
+import type { Query } from "./types/Query";
+import type { QueryResponse } from "./types/QueryResponse";
+
+/** Shapes the catalog endpoints return; no ts-rs export for these yet. */
+export interface PropertyKey {
+  key: string; source: string; type_guess: string; count: number;
+}
+export interface PropertyValue { value: string; count: number }
 
 async function getJson<T>(url: string): Promise<T | null> {
   try {
@@ -65,9 +73,34 @@ export const api = {
     return r.json();
   },
   logout: () => fetch("/api/auth/logout", { method: "POST" }),
+
+  // ── Catalog: what the insight builder autocompletes against ──
+  catalogEvents: (token: string, limit = 200) =>
+    getJson<string[]>(`/api/catalog/events?token=${q(token)}&limit=${limit}`),
+  catalogProperties: (token: string, source: "event" | "person" = "event") =>
+    getJson<PropertyKey[]>(`/api/catalog/properties?token=${q(token)}&source=${source}`),
+  catalogValues: (token: string, key: string, limit = 50) =>
+    getJson<PropertyValue[]>(
+      `/api/catalog/values?token=${q(token)}&key=${encodeURIComponent(key)}&limit=${limit}`,
+    ),
+
+  // ── The IR endpoint the builder drives ──
+  runQuery: async (token: string, query: Query, refresh = false): Promise<QueryResponse | null> => {
+    try {
+      const r = await fetch("/api/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: token.trim(), query, refresh }),
+      });
+      if (!r.ok) return null;
+      return (await r.json()) as QueryResponse;
+    } catch {
+      return null;
+    }
+  },
 };
 
-export type { Stats, EventCount, TrendPoint, FunnelStep, RecentEvent, FlagDef };
+export type { Stats, EventCount, TrendPoint, FunnelStep, RecentEvent, FlagDef, Query, QueryResponse };
 
 export interface SavedInsight {
   id: string; token: string; name: string; description: string;

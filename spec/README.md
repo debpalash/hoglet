@@ -31,10 +31,12 @@ filtering and breakdowns by any property, cohorts, feature flags with real
 targeting, saved insights on dashboards, sharing, projects and API keys — on one
 self-operated binary, at tens of millions of events, without query timeouts.
 
-**Honest current state:** the ingest spine and basic slices are built and solid
-(~10–15% of v1, the easy part). The bulk — query layer, filtering, real
-insights, sessions/persons/cohorts, auth, scale — is ahead. Phase status below
-is the ground truth.
+**Honest current state:** the ingest spine, the query layer, and the data model
+are built and tested; auth, saved insights, dashboards, and the insight builder
+work end to end. Roughly a third of v1. What remains is breadth rather than
+foundations: paths, cohort depth, flag continuity, rollups, and the measured
+benchmark. Phase status below is the ground truth — update it in the same change
+that moves the code, or it stops being true.
 
 Strategy and market: `../why-hoglet.md`, `../moats.md`, `../industry-map.md`.
 Rules and scope ladder: `../CLAUDE.md`. Decisions and build method:
@@ -117,11 +119,11 @@ retried; SQLite busy → identity retried, self-heals from log; query OOM/timeou
 | `wire-compat.md` | PostHog wire contract (capture, config, flags shapes, retry) | P0 | ✅ needs P8 additions |
 | `query-layer.md` | Query IR, SQL compiler, /api/query, caching, oracle | P1 | ✅ built |
 | `data-model.md` | Properties catalog, sessions, persons/profiles, groups, enrichment | P2 | ✅ built |
-| `insights.md` | Trends/funnels/retention/lifecycle/stickiness/paths templates + actor drill-down | P3 | ◐ core built, lifecycle/stickiness deferred |
+| `insights.md` | Trends/funnels/retention/lifecycle/stickiness/paths templates + actor drill-down | P3 | ◐ six kinds + actor drill-down built, paths deferred |
 | `auth.md` | Users, orgs/projects/roles, API keys, dashboard auth | P4 | ✅ built |
 | `cohorts-flags.md` | Cohorts (static+behavioral), flag targeting/payloads/continuity/local-eval | P5 | ◐ core built, continuity deferred |
-| `dashboards.md` | Saved insights, dashboard grid, sharing, insight-builder UI | P6 | ◐ backend built, insight builder deferred |
-| `scale.md` | Partitioning, rollups, session table, values catalog, cache, benchmark | P7 | ◐ cache + index built, partitioning deferred |
+| `dashboards.md` | Saved insights, dashboard grid, sharing, insight-builder UI | P6 | ◐ backend + insight builder built, drag-layout deferred |
+| `scale.md` | Partitioning, rollups, session table, values catalog, cache, benchmark | P7 | ◐ partitioning + cache + index built, rollups/benchmark deferred |
 | `launch.md` | Install story, demo, measured numbers, docs site | P8 | ✅ spec written, boss-gated |
 
 Writing a phase's spec is that phase's first task. The blueprint sections below
@@ -147,7 +149,7 @@ types; SDK contract test (real posthog-node, unpinned) + CI.
 Remaining P0 debt, folded into later phases: groups ingestion (P2), exception
 events (P2), local-eval endpoint (P5), surveys/EAF stubs (P8).
 
-### P1 — Query layer (the load-bearing rebuild) ○ → `query-layer.md`
+### P1 — Query layer (the load-bearing rebuild) ✅ (built) → `query-layer.md`
 
 Everything after this rides on it. Fixed per-endpoint SQL is replaced by a
 typed query IR compiled to DuckDB SQL.
@@ -171,10 +173,10 @@ Blueprint:
   last flush seq). Old `/api/*` endpoints become thin IR builders, then die.
 - **Oracle**: `oracle.rs` grows the same IR interpreter over `&[CapturedEvent]`;
   every kind cross-checked on varied + property-tested datasets.
-- Exit: trends-total/dau + filters + one breakdown run through IR end-to-end,
+- Exit: ✅ trends-total/dau + filters + one breakdown run through IR end-to-end,
   oracle-matched; dashboard switched to /api/query.
 
-### P2 — Data model maturity ○ → `data-model.md`
+### P2 — Data model maturity ✅ (built; GeoIP deferred) → `data-model.md`
 
 Blueprint:
 - **Properties catalog**: SQLite tables `event_names(token, name, last_seen,
@@ -195,7 +197,7 @@ Blueprint:
 - **Groups + exceptions ingestion** land here.
 - Exit: filter autocomplete works; session math answers; person list queryable.
 
-### P3 — Insight suite ○ → `insights.md`
+### P3 — Insight suite ◐ (six kinds + actor drill-down built; paths deferred) → `insights.md`
 
 Each insight = an IR kind + compiler template + oracle + UI panel. Order:
 1. **Trends complete**: full math matrix, formulas (A/B arithmetic over series
@@ -213,9 +215,11 @@ Each insight = an IR kind + compiler template + oracle + UI panel. Order:
    people behind the number; UI modal.
 - Exit: the six insight types oracle-proven and driven from the dashboard.
 
-### P4 — Auth & accounts ○ → `auth.md`
+### P4 — Auth & accounts ✅ (built) → `auth.md`
 
-Required before anyone runs this for real; currently the dashboard is open.
+Required before anyone runs this for real. Built: the dashboard shell is
+public, every `/api/*` route is gated, and the SPA renders setup or login off
+that 401.
 
 Blueprint:
 - SQLite `users(id, email, pw_hash argon2, created)`, `orgs`, `org_members
@@ -228,7 +232,7 @@ Blueprint:
 - UI: login page, org/project switcher, members page, key management.
 - Exit: fresh install forces account creation; anonymous `/api/*` is 401.
 
-### P5 — Cohorts & flags complete ○ → `cohorts-flags.md`
+### P5 — Cohorts & flags complete ◐ (core built; continuity + local-eval deferred) → `cohorts-flags.md`
 
 Blueprint:
 - **Cohorts**: SQLite `cohorts(token, name, kind: static|behavioral, definition
@@ -244,7 +248,7 @@ Blueprint:
 - Exit: flag targeted at a behavioral cohort evaluates correctly through a
   stock SDK; local-eval passes the SDK contract test.
 
-### P6 — Dashboards, saved insights, sharing ○ → `dashboards.md`
+### P6 — Dashboards, saved insights, sharing ◐ (builder + sharing built; drag-layout deferred) → `dashboards.md`
 
 Blueprint:
 - SQLite `insights(id, project, name, description, query_ir JSON, created_by)`,
@@ -256,15 +260,17 @@ Blueprint:
   drag-layout, date-override, share dialog.
 - Exit: build → save → pin → share loop works end to end.
 
-### P7 — Scale ○ → `scale.md`
+### P7 — Scale ◐ (partitioning + cache + index built; rollups + benchmark deferred) → `scale.md`
 
 Blueprint:
-- **Layout**: Parquet partitioned `events/{token}/{yyyy-mm-dd}/*.parquet`;
+- **Layout** ✅: Parquet partitioned `events/{token}/{yyyy-mm-dd}/*.parquet`;
+  queries build an explicit pruned file list; pre-partition flat files stay
+  readable, so upgrading needs no migration;
   compactor per-partition; queries prune by range + token before DuckDB sees a
   file list.
 - **Engine**: persistent DuckDB connection pool with attached views instead of
   per-request open+glob; rely on row-group stats for pushdown.
-- **Rollups**: flusher-maintained daily Parquet rollups (event×day×count,
+- **Rollups** ○ (next): flusher-maintained daily Parquet rollups (event×day×count,
   person-day for DAU sketches); trends hits rollups when the IR allows, raw
   otherwise; correctness guarded by the oracle comparing rollup vs raw paths.
 - **Caching**: result cache with data-version invalidation (already speced in
@@ -287,7 +293,7 @@ naming, publishing (decisions.md).
 ## 5. Cross-phase workstreams
 
 - **Compatibility harness** (continuous): nightly contract tests vs SDK
-  `latest` (node ✅, browser ◐ scaffolded, python/mobile ○). Each phase that
+  `latest` (node ✅, browser ✅ Chromium via Playwright, python/mobile ○). Each phase that
   touches the edge adds a contract case, not just unit tests.
 - **Oracle discipline** (continuous): every query kind, rollup path, and flag
   evaluation has an independent Rust check. This is claim 4's spirit applied

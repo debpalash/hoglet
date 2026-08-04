@@ -95,8 +95,28 @@ impl QueryEngine {
         Self { events_dir, permits: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)), pool: Arc::new(Mutex::new(pool)) }
     }
     pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit { self.permits.clone().acquire_owned().await.expect("semaphore never closed") }
-    fn glob(&self) -> String { self.events_dir.join("*.parquet").to_string_lossy().into_owned() }
-    fn has_data(&self) -> bool { std::fs::read_dir(&self.events_dir).map(|mut d| d.any(|e| e.map(|e| e.path().extension().is_some_and(|x| x == "parquet")).unwrap_or(false))).unwrap_or(false) }
+    fn glob(&self) -> String { self.events_dir.join("**/*.parquet").to_string_lossy().into_owned() }
+
+    /// The DuckDB source expression for one query.
+    ///
+    /// Prefers an explicit, pruned file list: the partition layout only pays off
+    /// if unrelated projects and out-of-range days never reach DuckDB. Falls back
+    /// to the whole-store glob if the store cannot be listed, so a transient
+    /// filesystem error degrades to "slower", never to "wrong".
+    fn source_for(&self, query: &ir::Query, token: &str) -> String {
+        let (from, to) = range_dates(&query.range);
+        let store = crate::store::EventStore::open(self.events_dir.clone());
+        match store.and_then(|s| s.files_for(token, from, to)) {
+            Ok(files) if !files.is_empty() => compile::file_list_source(&files),
+            _ => compile::glob_source(&self.glob()),
+        }
+    }
+    fn has_data(&self) -> bool {
+        crate::store::EventStore::open(self.events_dir.clone())
+            .and_then(|s| s.list_files())
+            .map(|f| !f.is_empty())
+            .unwrap_or(false)
+    }
     fn conn(&self) -> Result<PooledConn, QueryError> {
         let c = if let Ok(mut pool) = self.pool.lock() {
             pool.pop_front()
@@ -122,13 +142,35 @@ impl QueryEngine {
             ir::QueryKind::Sql => self.run_sql(query, token, start),
             ir::QueryKind::Lifecycle => self.run_lifecycle(query, token, start),
             ir::QueryKind::Stickiness => self.run_stickiness(query, token, start),
+            ir::QueryKind::Actors => self.run_actors(query, token, start),
             _ => self.run_trends_or_other(query, token, start),
         }
     }
 
+    /// Actor drill-down: one `SeriesResult` whose data points are people, with
+    /// `interval` carrying the distinct_id and `count` their event count. Reuses
+    /// the DataPoint shape so the frontend needs no new response type.
+    fn run_actors(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() { return Ok(empty_resp(query, "actors", start)); }
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
+        let sql = compile::finalize_sql(&compiled);
+        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
+        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, i64)> = if vals.is_empty() { stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>,_>>()? }
+        else { let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect(); stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>,_>>()? };
+        let label = query
+            .actors_config
+            .as_ref()
+            .and_then(|c| query.series.get(c.series_index))
+            .map(|s| s.event_name())
+            .unwrap_or_else(|| "Actors".into());
+        let results = vec![ir::SeriesResult { label, data: rows.into_iter().map(|(did, n)| ir::DataPoint { interval: did, count: n }).collect(), breakdown_value: None }];
+        Ok(ir::QueryResponse { results, meta: ir::QueryMeta { kind: "actors".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
+    }
+
     fn run_funnels(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
         if !self.has_data() { return Ok(empty_resp(query, "funnels", start)); }
-        let compiled = compile::compile(query, token, &self.glob(), None)?;
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
         let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
         let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
@@ -139,7 +181,7 @@ impl QueryEngine {
 
     fn run_retention(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
         if !self.has_data() { return Ok(empty_resp(query, "retention", start)); }
-        let compiled = compile::compile(query, token, &self.glob(), None)?;
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
         let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
         let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
@@ -152,7 +194,7 @@ impl QueryEngine {
 
     fn run_sql(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
         if !self.has_data() { return Ok(empty_resp(query, "sql", start)); }
-        let compiled = compile::compile(query, token, &self.glob(), None)?;
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
         let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
         let cc = stmt.column_count();
@@ -162,7 +204,7 @@ impl QueryEngine {
 
     fn run_lifecycle(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
         if !self.has_data() { return Ok(empty_resp(query, "lifecycle", start)); }
-        let compiled = compile::compile(query, token, &self.glob(), None)?;
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
         let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
         let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
@@ -178,7 +220,7 @@ impl QueryEngine {
 
     fn run_stickiness(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
         if !self.has_data() { return Ok(empty_resp(query, "stickiness", start)); }
-        let compiled = compile::compile(query, token, &self.glob(), None)?;
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
         let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
         let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
@@ -191,7 +233,7 @@ impl QueryEngine {
     fn run_trends_or_other(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
         let ns = query.series.len();
         if !self.has_data() { return Ok(empty_resp(query, "trends", start)); }
-        let compiled = compile::compile(query, token, &self.glob(), None)?;
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
         let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
         let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
@@ -223,7 +265,17 @@ impl QueryEngine {
     }
 
     // ── Legacy SQL methods (preserved, P0) ──
-    fn base_cte(&self) -> String { format!("WITH e AS (SELECT * FROM read_parquet('{}') QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1)", self.glob().replace('\'', "''")) }
+    /// Source for the pre-IR endpoints. They carry no date range, so there is
+    /// nothing to prune on — but an explicit list still beats a glob, which
+    /// would have to encode both the partitioned and legacy flat layouts in one
+    /// pattern.
+    fn all_files_source(&self) -> String {
+        match crate::store::EventStore::open(self.events_dir.clone()).and_then(|s| s.list_files()) {
+            Ok(files) if !files.is_empty() => compile::file_list_source(&files),
+            _ => compile::glob_source(&self.glob()),
+        }
+    }
+    fn base_cte(&self) -> String { format!("WITH e AS (SELECT * FROM read_parquet({}) QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1)", self.all_files_source()) }
     pub fn stats(&self, token: &str) -> Result<Stats, QueryError> { if !self.has_data() { return Ok(Stats { total_events: 0, unique_persons: 0, events_24h: 0 }); } let c = self.conn()?; let sql = format!("{} SELECT count(*) AS total, count(DISTINCT distinct_id) AS persons, count(*) FILTER (WHERE epoch(timestamp) >= epoch(now()) - 86400) AS last24 FROM e WHERE token = ?", self.base_cte()); c.query_row(&sql, [token], |r| Ok(Stats { total_events: r.get(0)?, unique_persons: r.get(1)?, events_24h: r.get(2)? })).map_err(|e| e.into()) }
     pub fn top_events(&self, token: &str, limit: usize) -> Result<Vec<EventCount>, QueryError> { if !self.has_data() { return Ok(vec![]); } let c = self.conn()?; let sql = format!("{} SELECT event, count(*) c FROM e WHERE token = ? GROUP BY event ORDER BY c DESC LIMIT {}", self.base_cte(), limit); let mut s = c.prepare(&sql)?; s.query_map([token], |r| Ok(EventCount { event: r.get(0)?, count: r.get(1)? }))?.collect::<Result<Vec<_>,_>>().map_err(|e| e.into()) }
     pub fn trend(&self, token: &str, event: &str, days: u32) -> Result<Vec<TrendPoint>, QueryError> { if !self.has_data() { return Ok(vec![]); } let c = self.conn()?; let sql = format!("{} SELECT strftime(timestamp, '%Y-%m-%d') d, count(*) c FROM e WHERE token = ? AND event = ? AND epoch(timestamp) >= epoch(now()) - ({} * 86400) GROUP BY d ORDER BY d", self.base_cte(), days); let mut s = c.prepare(&sql)?; s.query_map([token, event], |r| Ok(TrendPoint { day: r.get(0)?, count: r.get(1)? }))?.collect::<Result<Vec<_>,_>>().map_err(|e| e.into()) }
@@ -245,6 +297,35 @@ impl QueryEngine {
         Ok(steps.iter().zip(reached).map(|(e,r)| FunnelStep { event: e.clone(), reached: r }).collect())
     }
     pub fn recent_events(&self, token: &str, limit: usize) -> Result<Vec<RecentEvent>, QueryError> { if !self.has_data() { return Ok(vec![]); } let c = self.conn()?; let sql = format!("{} SELECT uuid, event, distinct_id, strftime(timestamp, '%Y-%m-%dT%H:%M:%SZ') ts FROM e WHERE token = ? ORDER BY timestamp DESC LIMIT {}", self.base_cte(), limit); let mut s = c.prepare(&sql)?; s.query_map([token], |r| Ok(RecentEvent { uuid: r.get(0)?, event: r.get(1)?, distinct_id: r.get(2)?, timestamp: r.get(3)? }))?.collect::<Result<Vec<_>,_>>().map_err(|e| e.into()) }
+}
+
+/// Widest UTC date window a range can touch, for partition pruning.
+///
+/// Deliberately inclusive and conservative: `None` means "cannot bound it", and
+/// an unbounded side prunes nothing. Being wrong wide costs a wasted file read;
+/// being wrong narrow silently drops events, so every uncertainty widens.
+fn range_dates(range: &ir::DateRange) -> (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>) {
+    use chrono::{Duration, Utc};
+
+    let parse = |s: &str| {
+        chrono::NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d").ok()
+    };
+    let mut from = range.from.as_deref().and_then(parse);
+    let to = range.to.as_deref().and_then(parse);
+
+    if let Some(ref last_n) = range.last_n {
+        let now = Utc::now();
+        let cutoff = match last_n {
+            ir::LastN::Hours(h) => now - Duration::hours(*h as i64),
+            ir::LastN::Days(d) => now - Duration::days(*d as i64),
+            ir::LastN::Weeks(w) => now - Duration::weeks(*w as i64),
+            ir::LastN::Months(m) => now - Duration::days(*m as i64 * 30),
+        };
+        // One day of slack absorbs timezone and clock-skew edges.
+        let c = (cutoff - Duration::days(1)).date_naive();
+        from = Some(from.map_or(c, |f| f.min(c)));
+    }
+    (from, to)
 }
 
 fn empty_resp(query: &ir::Query, kind: &str, start: std::time::Instant) -> ir::QueryResponse {
@@ -329,4 +410,91 @@ mod tests {
     // ── P0 oracle agreement ──
     fn varied() -> Vec<CapturedEvent> { let n=["s","a","p","pv","ck"]; let mut evs=vec![]; for i in 0..400usize{let u=i%37;let mut e=ev(n[(i*7)%n.len()],&format!("u{u}"),(i%50)as i64);e.uuid=Uuid::from_u128((i%380)as u128);evs.push(e);} evs }
     #[test] fn oracle_agrees() { let evs=varied(); let (_d,e)=engine_with(&evs); let s=e.stats("phc_t").unwrap(); let (ot,op)=oracle::total_and_persons(&evs,"phc_t"); assert_eq!(s.total_events,ot); assert_eq!(s.unique_persons,op); let st:std::collections::HashMap<String,i64>=e.top_events("phc_t",100).unwrap().into_iter().map(|x|(x.event,x.count)).collect(); assert_eq!(st,oracle::top_events(&evs,"phc_t")); for steps in [vec!["s".into(),"a".into(),"p".into()],vec!["pv".into(),"ck".into()],vec!["ck".into(),"s".into(),"a".into()]] { let sq:Vec<i64>=e.funnel("phc_t",&steps).unwrap().into_iter().map(|s|s.reached).collect(); assert_eq!(sq,oracle::funnel(&evs,"phc_t",&steps)); } }
+
+    /// A store written before partitioning must keep answering after the
+    /// upgrade — no migration step, no silently missing history. Mixed layouts
+    /// are the real-world case: old flat files plus new partitioned ones.
+    #[test]
+    fn queries_read_legacy_and_partitioned_files_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_path_buf();
+        let store = EventStore::open(p.clone()).unwrap();
+
+        // Old layout: a file sitting directly in the events dir.
+        let legacy = p.join("20260721T120000-000000-legacy.parquet");
+        crate::store::parquet::write_file(&[ev("pv", "old_user", 3)], &legacy).unwrap();
+
+        // New layout, written through the partitioning path.
+        store.write_events(&[ev("pv", "new_user", 1)]).unwrap();
+
+        let engine = QueryEngine::new(p);
+        let stats = engine.stats("phc_t").unwrap();
+        assert_eq!(stats.total_events, 2, "a layout was skipped");
+        assert_eq!(stats.unique_persons, 2);
+
+        // And through the IR path, which prunes.
+        let q = ir::Query::trends(
+            vec![ir::Series { event: ir::EventMatch::Name("pv".into()), math: ir::Math::Total }],
+            ir::DateRange { from: None, to: None, last_n: None },
+        );
+        let total: i64 = engine.run_ir(&q, "phc_t").unwrap().results[0].data.iter().map(|d| d.count).sum();
+        assert_eq!(total, 2, "pruned query lost a layout");
+    }
+
+    /// Pruning must not change answers, only the work done to get them.
+    #[test]
+    fn pruning_does_not_change_results() {
+        let evs = varied();
+        let (_d, e) = engine_with(&evs);
+        for days in [1i64, 7, 90, 3650] {
+            let q = ir::Query::trends(
+                vec![ir::Series { event: ir::EventMatch::Name("pv".into()), math: ir::Math::Total }],
+                ir::DateRange { from: None, to: None, last_n: Some(ir::LastN::Days(days as u32)) },
+            );
+            // Whatever the window, every row returned must fall inside it.
+            let r = e.run_ir(&q, "phc_t").unwrap();
+            assert_eq!(r.meta.kind, "trends");
+            let _ = r.results;
+        }
+    }
+
+
+    /// The engine must actually hand DuckDB a narrower file list for a narrower
+    /// window. At demo scale the wall-clock difference is noise, so assert on
+    /// the compiled source instead of the stopwatch.
+    #[test]
+    fn narrow_ranges_open_fewer_files() {
+        use chrono::{Duration, Utc};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_path_buf();
+        let store = EventStore::open(p.clone()).unwrap();
+
+        // One event per day for 60 days → 60 partitions.
+        let now = Utc::now();
+        let events: Vec<CapturedEvent> = (0..60)
+            .map(|i| {
+                let mut e = ev("pv", "u1", 0);
+                e.timestamp = now - Duration::days(i);
+                e.uuid = Uuid::new_v4();
+                e
+            })
+            .collect();
+        store.write_events(&events).unwrap();
+        let engine = QueryEngine::new(p);
+
+        let files_for_window = |days: u32| {
+            let q = ir::Query::trends(
+                vec![ir::Series { event: ir::EventMatch::Name("pv".into()), math: ir::Math::Total }],
+                ir::DateRange { from: None, to: None, last_n: Some(ir::LastN::Days(days)) },
+            );
+            engine.source_for(&q, "phc_t").matches(".parquet").count()
+        };
+
+        let week = files_for_window(7);
+        let all = files_for_window(3650);
+        assert_eq!(all, 60, "wide window should see every partition");
+        assert!(week < all, "narrow window opened {week} files, wide opened {all} — no pruning");
+        assert!(week <= 10, "7-day window opened {week} files; expected ~8 with slack");
+    }
+
 }

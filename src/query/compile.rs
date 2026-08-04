@@ -44,13 +44,15 @@ impl From<std::fmt::Error> for CompileError {
 
 /// Compile a Query IR into an executable DuckDB query.
 ///
-/// `parquet_glob` is the glob pattern for Parquet files (e.g. `events/*.parquet`).
+/// `source` is a ready-to-embed DuckDB source expression — build it with
+/// [`glob_source`] or [`file_list_source`], never by hand. Quoting and escaping
+/// live in those two functions so no call site can get it wrong.
 /// `identity_db_path` is the path to the SQLite identity database for person
 /// filters (None = person filters are unsupported, will error).
 pub fn compile(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
     _identity_db_path: Option<&str>,
 ) -> Result<CompiledQuery, CompileError> {
     query
@@ -60,14 +62,122 @@ pub fn compile(
         }))?;
 
     match query.kind {
-        QueryKind::Trends => compile_trends(query, token, parquet_glob),
-        QueryKind::Funnels => compile_funnels(query, token, parquet_glob),
-        QueryKind::Retention => compile_retention(query, token, parquet_glob),
-        QueryKind::Sql => compile_sql(query, token, parquet_glob),
-        QueryKind::Lifecycle => compile_lifecycle(query, token, parquet_glob),
-        QueryKind::Stickiness => compile_stickiness(query, token, parquet_glob),
-        _ => Err(CompileError::Unsupported("insight kind not yet implemented")),
+        QueryKind::Trends => compile_trends(query, token, source),
+        QueryKind::Funnels => compile_funnels(query, token, source),
+        QueryKind::Retention => compile_retention(query, token, source),
+        QueryKind::Sql => compile_sql(query, token, source),
+        QueryKind::Lifecycle => compile_lifecycle(query, token, source),
+        QueryKind::Stickiness => compile_stickiness(query, token, source),
+        QueryKind::Actors => compile_actors(query, token, source),
     }
+}
+
+// ── Parquet source expressions ────────────────────────────────────
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Read everything matching a glob. The whole-store fallback.
+pub fn glob_source(glob: &str) -> String {
+    sql_string(glob)
+}
+
+/// Read an explicit list of files — the partitioned path. DuckDB opens exactly
+/// these and nothing else, which is what makes partition pruning real rather
+/// than advisory (`spec/scale.md` §1).
+///
+/// An empty list has no valid SQL spelling, so callers must fall back to a glob;
+/// `QueryEngine::has_data` already gates that case.
+pub fn file_list_source(files: &[std::path::PathBuf]) -> String {
+    let quoted: Vec<String> = files
+        .iter()
+        .map(|f| sql_string(&f.to_string_lossy()))
+        .collect();
+    format!("[{}]", quoted.join(", "))
+}
+
+// ── Actors (drill-down) ───────────────────────────────────────────
+
+/// The people behind a number. Every other kind aggregates actors away; this
+/// one stops one step earlier and returns them, so a result cell can be opened.
+///
+/// Scoped by the same filters and date range as the insight it came from, so
+/// the row count here reconciles with the cell that was clicked. `day` narrows
+/// to a single interval bucket (the clicked column); empty means the whole range.
+fn compile_actors(
+    query: &Query,
+    token: &str,
+    source: &str,
+) -> Result<CompiledQuery, CompileError> {
+    let cfg = query
+        .actors_config
+        .as_ref()
+        .ok_or(CompileError::Validation("actors_config is required for Actors queries"))?;
+    let series = query
+        .series
+        .get(cfg.series_index)
+        .ok_or(CompileError::Validation("actors_config.series_index is out of range"))?;
+
+    let mut params: Vec<ParamValue> = Vec::new();
+    params.push(ParamValue::Text(token.to_string()));
+    let mut sql = format!(
+        "WITH deduped AS (\n\
+         \x20   SELECT * FROM read_parquet({source})\n\
+         \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
+         ),\n\
+         e AS (\n\
+         \x20   SELECT * FROM deduped WHERE token = $1\n\
+         )\n"
+    );
+
+    let mut where_clauses: Vec<String> = Vec::new();
+
+    // Empty for EventMatch::Any — every event counts, so there is nothing to add.
+    let event_filter = compile_event_match(&series.event, &mut params);
+    if !event_filter.is_empty() {
+        where_clauses.push(event_filter);
+    }
+
+    let (filter_sql, filter_params) = compile_property_group(&query.filters, "e")?;
+    params.extend(filter_params);
+    if !filter_sql.is_empty() {
+        where_clauses.push(filter_sql);
+    }
+
+    let (range_sql, range_params) = compile_date_range(&query.range)?;
+    params.extend(range_params);
+    if !range_sql.is_empty() {
+        where_clauses.push(range_sql);
+    }
+
+    if !cfg.day.is_empty() {
+        let interval_expr = interval_sql(query.interval);
+        params.push(ParamValue::Text(cfg.day.clone()));
+        where_clauses.push(format!("{interval_expr} = ${}", params.len()));
+    }
+
+    let where_clause = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}\n", where_clauses.join(" AND "))
+    };
+
+    // Capped hard: a drill-down must never stream an unbounded person list back
+    // into the dashboard.
+    let limit = cfg.limit.clamp(1, 1000);
+    let offset = cfg.offset;
+
+    sql.push_str(&format!(
+        "SELECT distinct_id, count(*) AS event_count, max(timestamp) AS last_seen\n\
+         FROM e\n\
+         {where_clause}\
+         GROUP BY distinct_id\n\
+         ORDER BY event_count DESC, distinct_id\n\
+         LIMIT {limit} OFFSET {offset}"
+    ));
+
+    Ok(CompiledQuery { sql, params })
 }
 
 // ── Trends compilation ────────────────────────────────────────────
@@ -75,17 +185,16 @@ pub fn compile(
 fn compile_trends(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     let interval_expr = interval_sql(query.interval);
     let mut params: Vec<ParamValue> = Vec::new();
 
     // Base CTE: deduped events scoped to token.
-    let escaped_glob = parquet_glob.replace('\'', "''");
     params.push(ParamValue::Text(token.to_string()));
     let mut sql = format!(
         "WITH deduped AS (\n\
-         \x20   SELECT * FROM read_parquet('{escaped_glob}')\n\
+         \x20   SELECT * FROM read_parquet({source})\n\
          \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
@@ -156,7 +265,7 @@ fn compile_trends(
 fn compile_funnels(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     if query.series.is_empty() {
         return Err(CompileError::Validation("funnels requires at least one step"));
@@ -178,13 +287,12 @@ fn compile_funnels(
     let order_type = config.map(|c| c.order_type).unwrap_or_default();
     let window = config.and_then(|c| c.conversion_window_seconds);
 
-    let escaped_glob = parquet_glob.replace('\'', "''");
     let mut params: Vec<ParamValue> = Vec::new();
     params.push(ParamValue::Text(token.to_string()));
 
     let mut sql = format!(
         "WITH deduped AS (\n\
-         \x20   SELECT * FROM read_parquet('{escaped_glob}')\n\
+         \x20   SELECT * FROM read_parquet({source})\n\
          \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
@@ -193,7 +301,16 @@ fn compile_funnels(
     );
 
     let (filter_sql, filter_params) = compile_property_group(&query.filters, "e")?;
-    params.extend(filter_params);
+    // Deliberately NOT extended into `params` here. `finalize_sql` replaces $P
+    // positionally, so params must be pushed in the order their placeholders
+    // appear in the SQL text. The ordered branch emits a token placeholder per
+    // step CTE *before* that step's filter placeholders, so binding the filters
+    // up front shifts every parameter by one and DuckDB rejects the query.
+    let bind_filters = |params: &mut Vec<ParamValue>| {
+        if !filter_sql.is_empty() {
+            params.extend(filter_params.iter().cloned());
+        }
+    };
 
     match order_type {
         FunnelOrder::Ordered => {
@@ -211,6 +328,7 @@ fn compile_funnels(
             if !filter_sql.is_empty() {
                 ctes[0].push_str(&format!(" AND {filter_sql}"));
             }
+            bind_filters(&mut params);
             ctes[0].push_str(" GROUP BY distinct_id)");
 
             for i in 1..steps.len() {
@@ -234,6 +352,7 @@ fn compile_funnels(
                 if !filter_sql.is_empty() {
                     cte.push_str(&format!(" AND {filter_sql}"));
                 }
+                bind_filters(&mut params);
                 cte.push_str(&format!(" GROUP BY s{prev}.distinct_id", prev = i - 1));
                 cte.push(')');
                 ctes.push(cte);
@@ -250,6 +369,9 @@ fn compile_funnels(
             ));
         }
         FunnelOrder::Unordered => {
+            // Only one filter site here, and the enclosing `e` CTE already bound
+            // the token, so plain append is the SQL-text order.
+            bind_filters(&mut params);
             // Unordered: all steps within window. Count distinct_ids that
             // completed all steps (any order) within the window.
             let step_conditions: Vec<String> = steps
@@ -280,7 +402,7 @@ fn compile_funnels(
 fn compile_sql(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     let config = query
         .sql_config
@@ -296,12 +418,11 @@ fn compile_sql(
         return Err(CompileError::Validation("only SELECT queries are allowed"));
     }
 
-    let escaped_glob = parquet_glob.replace('\'', "''");
     let escaped_token = token.replace('\'', "''");
 
     let sql = format!(
         "WITH events AS (\n\
-         \x20   SELECT * FROM read_parquet('{escaped_glob}')\n\
+         \x20   SELECT * FROM read_parquet({source})\n\
          \x20   WHERE token = '{escaped_token}'\n\
          \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
          )\n\
@@ -314,7 +435,7 @@ fn compile_sql(
 fn compile_retention(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     let config = query
         .retention_config
@@ -337,13 +458,12 @@ fn compile_retention(
     };
     let total_periods = config.total_periods.min(90);
 
-    let escaped_glob = parquet_glob.replace('\'', "''");
     let mut params: Vec<ParamValue> = Vec::new();
     params.push(ParamValue::Text(token.to_string()));
 
     let sql = format!(
         "WITH deduped AS (\n\
-         \x20   SELECT * FROM read_parquet('{escaped_glob}')\n\
+         \x20   SELECT * FROM read_parquet({source})\n\
          \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
@@ -376,18 +496,17 @@ fn compile_retention(
 fn compile_lifecycle(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     let config = query.lifecycle_config.as_ref()
         .ok_or(CompileError::Validation("lifecycle requires lifecycle_config"))?;
     let event = match &config.event { EventMatch::Name(n) => n.clone(), _ => return Err(CompileError::Validation("lifecycle event must be named")) };
     let period = match config.prior_period { LifecyclePeriod::Day => "DAY", LifecyclePeriod::Week => "WEEK", LifecyclePeriod::Month => "MONTH" };
 
-    let escaped_glob = parquet_glob.replace('\'', "''");
     let params = vec![ParamValue::Text(token.to_string())];
 
     let sql = format!(
-        "WITH deduped AS (SELECT * FROM read_parquet('{escaped_glob}') QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1),
+        "WITH deduped AS (SELECT * FROM read_parquet({source}) QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1),
          e AS (SELECT * FROM deduped WHERE token = $P),
          current AS (
             SELECT distinct_id, date_trunc('{period}', timestamp) AS period
@@ -421,18 +540,17 @@ fn compile_lifecycle(
 fn compile_stickiness(
     query: &Query,
     token: &str,
-    parquet_glob: &str,
+    source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     let config = query.stickiness_config.as_ref()
         .ok_or(CompileError::Validation("stickiness requires stickiness_config"))?;
     let event = match &config.event { EventMatch::Name(n) => n.clone(), _ => return Err(CompileError::Validation("stickiness event must be named")) };
     let window_days = config.window_days.min(90);
 
-    let escaped_glob = parquet_glob.replace('\'', "''");
     let params = vec![ParamValue::Text(token.to_string())];
 
     let sql = format!(
-        "WITH deduped AS (SELECT * FROM read_parquet('{escaped_glob}') QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1),
+        "WITH deduped AS (SELECT * FROM read_parquet({source}) QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1),
          e AS (SELECT * FROM deduped WHERE token = $P),
          user_counts AS (
             SELECT distinct_id, count(*) AS event_count
@@ -827,5 +945,295 @@ pub fn param_to_duckdb(p: &ParamValue) -> duckdb::types::Value {
         ParamValue::Float(f) => duckdb::types::Value::Double(*f),
         ParamValue::Bool(b) => duckdb::types::Value::Boolean(*b),
         ParamValue::Null => duckdb::types::Value::Null,
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+//
+// These test the compiler directly. The oracle in `mod.rs` proves the numbers
+// are right end-to-end; what it cannot see is the SQL text itself — whether a
+// value was bound or pasted, whether a limit clamped, whether an unsupported
+// shape failed loudly instead of silently compiling to something wrong.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GLOB: &str = "events/*.parquet";
+
+    /// Call sites pass a source expression, not a raw glob.
+    fn src() -> String { glob_source(GLOB) }
+
+    fn series(name: &str) -> Series {
+        Series { event: EventMatch::Name(name.into()), math: Math::Total }
+    }
+
+    fn open_range() -> DateRange {
+        DateRange { from: None, to: None, last_n: None }
+    }
+
+    fn q(kind: QueryKind) -> Query {
+        Query { kind, ..Query::trends(vec![series("pageview")], open_range()) }
+    }
+
+    fn texts(c: &CompiledQuery) -> Vec<String> {
+        c.params
+            .iter()
+            .filter_map(|p| match p {
+                ParamValue::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every kind the IR can express must compile. `Actors` returned
+    /// "not yet implemented" until it was built — a gap the oracle could not
+    /// catch, because an unsupported kind never reaches it.
+    #[test]
+    fn every_query_kind_compiles() {
+        let kinds = [
+            QueryKind::Trends,
+            QueryKind::Funnels,
+            QueryKind::Retention,
+            QueryKind::Lifecycle,
+            QueryKind::Stickiness,
+            QueryKind::Sql,
+            QueryKind::Actors,
+        ];
+        for kind in kinds {
+            let label = format!("{kind:?}");
+            let mut query = q(kind);
+            query.funnel_config = Some(FunnelConfig {
+                order_type: FunnelOrder::default(),
+                conversion_window_seconds: None,
+                exclusions: vec![],
+                attribution: FunnelAttribution::default(),
+            });
+            query.retention_config = Some(RetentionConfig {
+                cohort_event: EventMatch::Name("signup".into()),
+                retention_event: EventMatch::Name("pageview".into()),
+                ..RetentionConfig::default()
+            });
+            query.actors_config = Some(ActorsConfig {
+                series_index: 0,
+                day: String::new(),
+                offset: 0,
+                limit: 100,
+            });
+            query.lifecycle_config = Some(LifecycleConfig {
+                event: EventMatch::Name("pageview".into()),
+                prior_period: LifecyclePeriod::default(),
+            });
+            query.stickiness_config = Some(StickinessConfig {
+                event: EventMatch::Name("pageview".into()),
+                window_days: 30,
+            });
+            query.sql_config = Some(SqlConfig { sql: "SELECT 1".into() });
+            let compiled = compile(&query, "phc_t", &src(), None)
+                .unwrap_or_else(|e| panic!("{label} failed to compile: {e}"));
+            assert!(!compiled.sql.is_empty(), "{label} compiled to empty SQL");
+        }
+    }
+
+    /// The module header promises no string interpolation of user-controlled
+    /// values. A quote-heavy filter value is the test of that promise: it must
+    /// arrive as a bound parameter, not as SQL text.
+    #[test]
+    fn filter_values_are_bound_not_interpolated() {
+        let nasty = "'; DROP TABLE events; --";
+        let mut query = q(QueryKind::Trends);
+        query.filters = PropertyGroup {
+            op: GroupOp::And,
+            values: vec![GroupOrFilter::Filter(Filter {
+                source: FilterSource::Event,
+                key: "browser".into(),
+                operator: FilterOperator::Exact,
+                value: serde_json::json!(nasty),
+            })],
+        };
+        let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+        assert!(
+            !compiled.sql.contains("DROP TABLE"),
+            "filter value leaked into SQL text: {}",
+            compiled.sql
+        );
+        assert!(texts(&compiled).iter().any(|p| p == nasty), "value was not bound");
+    }
+
+    /// Same promise for the token, which arrives from an HTTP query string.
+    #[test]
+    fn token_is_bound_not_interpolated() {
+        let compiled = compile(&q(QueryKind::Trends), "phc_'; --", GLOB, None).unwrap();
+        assert!(!compiled.sql.contains("phc_'; --"), "token leaked into SQL text");
+        assert!(texts(&compiled).iter().any(|p| p == "phc_'; --"));
+    }
+
+    /// A drill-down feeds a person list to the browser, so its limit is a real
+    /// bound, not a suggestion.
+    #[test]
+    fn actors_limit_is_clamped() {
+        let mut query = q(QueryKind::Actors);
+        query.actors_config = Some(ActorsConfig {
+            series_index: 0,
+            day: String::new(),
+            offset: 0,
+            limit: 100_000,
+        });
+        let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+        assert!(compiled.sql.contains("LIMIT 1000"), "limit not clamped: {}", compiled.sql);
+
+        query.actors_config.as_mut().unwrap().limit = 0;
+        let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+        assert!(compiled.sql.contains("LIMIT 1"), "zero limit not raised: {}", compiled.sql);
+    }
+
+    /// Out-of-range drill-down must fail loudly. Silently compiling against
+    /// series 0 would answer a question nobody asked.
+    #[test]
+    fn actors_rejects_bad_series_index() {
+        let mut query = q(QueryKind::Actors);
+        query.actors_config = Some(ActorsConfig {
+            series_index: 7,
+            day: String::new(),
+            offset: 0,
+            limit: 10,
+        });
+        assert!(matches!(
+            compile(&query, "phc_t", &src(), None),
+            Err(CompileError::Validation(_))
+        ));
+
+        query.actors_config = None;
+        assert!(matches!(
+            compile(&query, "phc_t", &src(), None),
+            Err(CompileError::Validation(_))
+        ));
+    }
+
+    /// The clicked column narrows the drill-down, and the day is user input, so
+    /// it binds like everything else.
+    #[test]
+    fn actors_day_narrows_and_binds() {
+        let mut query = q(QueryKind::Actors);
+        query.actors_config = Some(ActorsConfig {
+            series_index: 0,
+            day: "2026-08-04".into(),
+            offset: 0,
+            limit: 10,
+        });
+        let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+        assert!(texts(&compiled).iter().any(|p| p == "2026-08-04"), "day not bound");
+        assert!(!compiled.sql.contains("2026-08-04"), "day interpolated into SQL");
+    }
+
+    /// IR validation runs before compilation, so a malformed query never
+    /// reaches SQL generation.
+    #[test]
+    fn validation_runs_before_compilation() {
+        let mut query = q(QueryKind::Trends);
+        query.series = vec![];
+        assert!(matches!(
+            compile(&query, "phc_t", &src(), None),
+            Err(CompileError::Validation(_))
+        ));
+
+        let mut query = q(QueryKind::Trends);
+        query.series = vec![series("")];
+        assert!(matches!(
+            compile(&query, "phc_t", &src(), None),
+            Err(CompileError::Validation(_))
+        ));
+    }
+
+    /// A glob containing a quote must not be able to close the string literal
+    /// it sits inside — it is structural, so it is escaped rather than bound.
+    #[test]
+    fn source_expressions_escape_quotes() {
+        // Paths are structural, so they are escaped rather than bound — but a
+        // quote in a path must still not be able to close the literal it sits in.
+        assert_eq!(glob_source("ev'ents/*.parquet"), "'ev''ents/*.parquet'");
+        let list = file_list_source(&[
+            std::path::PathBuf::from("a/1.parquet"),
+            std::path::PathBuf::from("b'/2.parquet"),
+        ]);
+        assert_eq!(list, "['a/1.parquet', 'b''/2.parquet']");
+
+        let compiled = compile(&q(QueryKind::Trends), "phc_t", &glob_source("ev'ents/*.parquet"), None).unwrap();
+        assert!(compiled.sql.contains("ev''ents/*.parquet"), "glob quote not escaped");
+    }
+
+    /// The compiler emits two placeholder spellings — `$P` (rewritten to `?` by
+    /// `finalize_sql`) and DuckDB's numbered `$1`. Both consume one entry from
+    /// the same parameter list, so count them together.
+    fn placeholder_count(sql: &str) -> usize {
+        let numbered = sql
+            .match_indices('$')
+            .filter(|(i, _)| sql[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .count();
+        sql.matches("$P").count() + numbered
+    }
+
+    /// `finalize_sql` substitutes $P positionally, so the number of bound
+    /// parameters must equal the number of placeholders — for every kind, with
+    /// and without filters. Ordered funnels got this wrong: each step CTE emits
+    /// a token placeholder before its filter placeholders, but the filters were
+    /// bound once up front, so everything shifted by one and DuckDB 500'd.
+    #[test]
+    fn param_count_matches_placeholders() {
+        let filtered = PropertyGroup {
+            op: GroupOp::And,
+            values: vec![GroupOrFilter::Filter(Filter {
+                source: FilterSource::Event,
+                key: "browser".into(),
+                operator: FilterOperator::Exact,
+                value: serde_json::json!("Chrome"),
+            })],
+        };
+
+        for with_filter in [false, true] {
+            for order in [FunnelOrder::Ordered, FunnelOrder::Unordered] {
+                for steps in 1..=3usize {
+                    let mut query = q(QueryKind::Funnels);
+                    query.series = (0..steps).map(|i| series(&format!("step{i}"))).collect();
+                    query.funnel_config = Some(FunnelConfig {
+                        order_type: order,
+                        conversion_window_seconds: None,
+                        exclusions: vec![],
+                        attribution: FunnelAttribution::default(),
+                    });
+                    if with_filter {
+                        query.filters = filtered.clone();
+                    }
+                    let c = compile(&query, "phc_t", &src(), None).unwrap();
+                    assert_eq!(
+                        placeholder_count(&c.sql),
+                        c.params.len(),
+                        "funnels order={order:?} steps={steps} filter={with_filter}",
+                    );
+                }
+            }
+        }
+
+        // And the simple kinds, which share the same substitution.
+        for kind in [QueryKind::Trends, QueryKind::Actors] {
+            let label = format!("{kind:?}");
+            let mut query = q(kind);
+            query.filters = filtered.clone();
+            query.actors_config = Some(ActorsConfig {
+                series_index: 0, day: "2026-08-04".into(), offset: 0, limit: 10,
+            });
+            let c = compile(&query, "phc_t", &src(), None).unwrap();
+            assert_eq!(placeholder_count(&c.sql), c.params.len(), "{label}");
+        }
+    }
+
+    /// Every interval maps to a distinct bucket expression; a collision would
+    /// silently answer "by day" for a "by week" question.
+    #[test]
+    fn intervals_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for interval in [Interval::Hour, Interval::Day, Interval::Week, Interval::Month] {
+            assert!(seen.insert(interval_sql(interval)), "{interval:?} duplicates another interval");
+        }
     }
 }

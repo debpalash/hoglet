@@ -113,24 +113,239 @@ function Flags({ token }: { token: string }) {
 
 // ── Insight builder ──────────────────────────────
 
-function makeQuery(kind: string, eventName: string) {
+const KINDS = ["Trends", "Funnels", "Retention", "Lifecycle", "Stickiness", "Actors"] as const;
+const MATHS = ["total", "dau", "wau", "mau", "unique_sessions", "first_time"] as const;
+const OPERATORS = ["exact", "not_equal", "icontains", "not_contains", "is_set", "is_not_set", "gt", "lt"] as const;
+const RANGES: [string, number][] = [["7 days", 7], ["30 days", 30], ["90 days", 90]];
+
+type FilterRow = { key: string; op: string; value: string };
+
+/** Build the IR the backend expects from the builder's current state. */
+function buildQuery(kind: string, events: string[], math: string, days: number,
+                    interval: string, filters: FilterRow[], breakdown: string) {
+  const valued = (op: string) => !["is_set", "is_not_set"].includes(op);
   return {
     kind,
-    series: [{ event: { type: "name", value: eventName }, math: { type: "total" as any } }],
-    filters: { op: "AND", values: [] },
-    range: { from: null, to: null, last_n: null },
-    interval: "Day",
+    series: events.map(e => ({ event: { type: "name", value: e }, math: { type: math } })),
+    filters: {
+      op: "AND",
+      // FilterOperator is adjacently tagged with only unit variants, so it is
+      // `{op}` alone — the operand rides on the filter's own `value` field.
+      values: filters.filter(f => f.key).map(f => ({
+        type: "filter",
+        source: "event",
+        key: f.key,
+        operator: { op: f.op },
+        value: valued(f.op) ? f.value : null,
+      })),
+    },
+    breakdown: breakdown ? { source: "event", key: breakdown, limit: 10 } : null,
+    range: { from: null, to: null, last_n: { unit: "d", value: days } },
+    interval,
     formulas: [],
+    // Funnels and Retention need their config or the compiler rejects them.
+    funnel_config: kind === "Funnels"
+      ? { order_type: "Ordered", conversion_window_seconds: null, exclusions: [], attribution: "AllSteps" }
+      : null,
+    retention_config: kind === "Retention"
+      ? { cohort_event: { type: "name", value: events[0] ?? "" },
+          retention_event: { type: "name", value: events[1] ?? events[0] ?? "" },
+          retention_type: "Recurring", period: "Day", total_periods: 7 }
+      : null,
+    lifecycle_config: kind === "Lifecycle"
+      ? { event: { type: "name", value: events[0] ?? "" }, prior_period: "Day" } : null,
+    stickiness_config: kind === "Stickiness"
+      ? { event: { type: "name", value: events[0] ?? "" }, window_days: days } : null,
+    actors_config: kind === "Actors"
+      ? { series_index: 0, day: "", offset: 0, limit: 100 } : null,
+    sql_config: null,
   };
+}
+
+/** The insight builder — an editor for the query IR.
+ *
+ *  Every control here maps to one IR field, and the IR it produces is exactly
+ *  what gets saved: the saved-insight format and the query format are the same
+ *  object, so anything buildable is savable and vice versa. */
+function InsightBuilder({ token, onSave }: { token: string; onSave: (ir: any, name: string) => void }) {
+  const [kind, setKind] = useState<string>("Trends");
+  const [events, setEvents] = useState<string[]>(["$pageview"]);
+  const [math, setMath] = useState<string>("total");
+  const [days, setDays] = useState(30);
+  const [interval, setInterval] = useState("Day");
+  const [filters, setFilters] = useState<FilterRow[]>([]);
+  const [breakdown, setBreakdown] = useState("");
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [name, setName] = useState("");
+
+  const [eventNames, setEventNames] = useState<string[]>([]);
+  const [propKeys, setPropKeys] = useState<string[]>([]);
+  const [valueHints, setValueHints] = useState<Record<string, string[]>>({});
+
+  useEffect(() => {
+    api.catalogEvents(token).then(e => setEventNames(e ?? []));
+    api.catalogProperties(token).then(p => setPropKeys((p ?? []).map(k => k.key)));
+  }, [token]);
+
+  // Pull value suggestions lazily, once per property actually used in a filter.
+  useEffect(() => {
+    for (const f of filters) {
+      if (f.key && !(f.key in valueHints)) {
+        setValueHints(v => ({ ...v, [f.key]: [] }));
+        api.catalogValues(token, f.key).then(vs =>
+          setValueHints(v => ({ ...v, [f.key]: (vs ?? []).map(x => x.value) })));
+      }
+    }
+  }, [filters, token, valueHints]);
+
+  const multiEvent = kind === "Funnels" || kind === "Retention";
+  const ir = () => buildQuery(kind, events.filter(Boolean), math, days, interval, filters, breakdown);
+
+  const run = async () => {
+    setBusy(true); setError("");
+    const r = await api.runQuery(token, ir() as any);
+    setBusy(false);
+    if (!r) { setError("Query failed — check the events and filters."); setResult(null); return; }
+    setResult(r);
+  };
+
+  const setEventAt = (i: number, v: string) =>
+    setEvents(es => es.map((e, j) => (j === i ? v : e)));
+
+  return (<div style={{ marginBottom: 20 }}>
+    <datalist id="event-names">{eventNames.map(e => <option key={e} value={e} />)}</datalist>
+    <datalist id="prop-keys">{propKeys.map(k => <option key={k} value={k} />)}</datalist>
+
+    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+      <select value={kind} onChange={e => { setKind(e.target.value); setResult(null); }}>
+        {KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+      </select>
+      {!multiEvent && (
+        <select value={math} onChange={e => setMath(e.target.value)}>
+          {MATHS.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+      )}
+      <select value={days} onChange={e => setDays(Number(e.target.value))}>
+        {RANGES.map(([l, v]) => <option key={v} value={v}>{l}</option>)}
+      </select>
+      <select value={interval} onChange={e => setInterval(e.target.value)}>
+        {["Hour", "Day", "Week", "Month"].map(i => <option key={i} value={i}>{i}</option>)}
+      </select>
+      <button onClick={run} disabled={busy}>{busy ? "Running…" : "Run"}</button>
+    </div>
+
+    <div style={{ marginBottom: 8 }}>
+      {events.map((ev, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 4, alignItems: "center" }}>
+          <span style={{ color: "var(--dim)", fontSize: 12, width: 48 }}>
+            {multiEvent ? `Step ${i + 1}` : "Event"}
+          </span>
+          <input list="event-names" value={ev} onChange={e => setEventAt(i, e.target.value)}
+                 placeholder="event name" style={{ width: 220 }} />
+          {events.length > 1 && (
+            <button onClick={() => setEvents(es => es.filter((_, j) => j !== i))}>−</button>
+          )}
+        </div>
+      ))}
+      <button onClick={() => setEvents(es => [...es, ""])} style={{ fontSize: 12 }}>
+        + {multiEvent ? "step" : "series"}
+      </button>
+    </div>
+
+    <div style={{ marginBottom: 8 }}>
+      {filters.map((f, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 4, alignItems: "center" }}>
+          <span style={{ color: "var(--dim)", fontSize: 12, width: 48 }}>{i === 0 ? "Where" : "and"}</span>
+          <input list="prop-keys" value={f.key} placeholder="property" style={{ width: 160 }}
+                 onChange={e => setFilters(fs => fs.map((x, j) => j === i ? { ...x, key: e.target.value } : x))} />
+          <select value={f.op}
+                  onChange={e => setFilters(fs => fs.map((x, j) => j === i ? { ...x, op: e.target.value } : x))}>
+            {OPERATORS.map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+          {!["is_set", "is_not_set"].includes(f.op) && (<>
+            <datalist id={`vals-${i}`}>
+              {(valueHints[f.key] ?? []).map(v => <option key={v} value={v} />)}
+            </datalist>
+            <input list={`vals-${i}`} value={f.value} placeholder="value" style={{ width: 160 }}
+                   onChange={e => setFilters(fs => fs.map((x, j) => j === i ? { ...x, value: e.target.value } : x))} />
+          </>)}
+          <button onClick={() => setFilters(fs => fs.filter((_, j) => j !== i))}>−</button>
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <button style={{ fontSize: 12 }}
+                onClick={() => setFilters(fs => [...fs, { key: "", op: "exact", value: "" }])}>
+          + filter
+        </button>
+        <span style={{ color: "var(--dim)", fontSize: 12, marginLeft: 8 }}>Breakdown</span>
+        <input list="prop-keys" value={breakdown} placeholder="none"
+               onChange={e => setBreakdown(e.target.value)} style={{ width: 160 }} />
+      </div>
+    </div>
+
+    {error && <div style={{ color: "#e55", marginBottom: 8 }}>{error}</div>}
+
+    {result && <ResultView result={result} />}
+
+    {result && (
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <input placeholder="Insight name" value={name} onChange={e => setName(e.target.value)} />
+        <button disabled={!name.trim()} onClick={() => { onSave(ir(), name.trim()); setName(""); }}>
+          Save insight
+        </button>
+      </div>
+    )}
+  </div>);
+}
+
+/** Renders whatever shape came back — a bar chart for one series over time,
+ *  a table when there are several or when the x-axis is not time. */
+function ResultView({ result }: { result: any }) {
+  const series: any[] = result.results ?? [];
+  if (!series.length || !series.some(s => (s.data?.length ?? 0) > 0)) {
+    return <div className="empty">No data for this query.</div>;
+  }
+  const single = series.length === 1;
+  const max = Math.max(1, ...series.flatMap(s => (s.data ?? []).map((d: any) => d.count)));
+
+  return (<div style={{ padding: 12, background: "var(--panel2)", borderRadius: 8 }}>
+    {single ? (
+      <div>
+        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 6 }}>
+          {series[0].label} — max {max.toLocaleString()}
+        </div>
+        {series[0].data.slice(0, 40).map((d: any) => (
+          <div key={d.interval} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
+            <span style={{ width: 130, fontSize: 12, color: "var(--dim)" }}>{d.interval}</span>
+            <div style={{ flex: 1, background: "var(--line)", borderRadius: 3, height: 12 }}>
+              <div style={{ width: `${(d.count / max) * 100}%`, background: "var(--accent)", height: "100%", borderRadius: 3 }} />
+            </div>
+            <span style={{ width: 60, textAlign: "right", fontSize: 12 }}>{d.count.toLocaleString()}</span>
+          </div>
+        ))}
+      </div>
+    ) : (
+      series.map((s, i) => (
+        <div key={i} style={{ marginBottom: 6 }}>
+          <strong>{s.label}</strong>
+          {s.breakdown_value ? <span className="did"> · {s.breakdown_value}</span> : null}
+          <span style={{ marginLeft: 8 }}>
+            {(s.data ?? []).slice(0, 8).map((d: any) => `${d.interval}: ${d.count.toLocaleString()}`).join("  ")}
+          </span>
+        </div>
+      ))
+    )}
+    <div style={{ fontSize: 11, color: "var(--dim)", marginTop: 6 }}>
+      {result.meta?.kind} · {result.meta?.elapsed_ms}ms{result.meta?.cached ? " · cached" : ""}
+    </div>
+  </div>);
 }
 
 function Insights({ token }: { token: string }) {
   const [insights, setInsights] = useState<SavedInsight[]>([]);
   const [dashboards, setDashboards] = useState<Dashboard[]>([]);
-  const [name, setName] = useState("");
-  const [eventName, setEventName] = useState("$pageview");
-  const [result, setResult] = useState<any>(null);
-  const [editing, setEditing] = useState(false);
 
   const load = async () => {
     const [ir, dr] = await Promise.all([
@@ -142,17 +357,12 @@ function Insights({ token }: { token: string }) {
   };
   useEffect(() => { load(); }, [token]);
 
-  const run = async () => {
-    const q = makeQuery("Trends", eventName);
-    const r = await fetch("/api/query", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token, query: q }) });
-    if (r.ok) setResult(await r.json());
-  };
-
-  const save = async () => {
-    if (!name.trim()) return;
-    const q = makeQuery("Trends", eventName);
-    const r = await fetch("/api/insights", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token, name, query_ir: q }) });
-    if (r.ok) { setName(""); setEditing(false); load(); }
+  const save = async (query_ir: any, name: string) => {
+    const r = await fetch("/api/insights", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, name, query_ir }),
+    });
+    if (r.ok) load();
   };
 
   const pinToDashboard = async (insightId: string, dashboardId: string) => {
@@ -165,38 +375,12 @@ function Insights({ token }: { token: string }) {
 
   return (<section className="panel">
     <h2>Insights</h2>
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
-        <input placeholder="Event name" value={eventName} onChange={e => setEventName(e.target.value)} style={{ width: 200 }} />
-        <button onClick={run}>Run query</button>
-        <button onClick={() => setEditing(true)} disabled={editing}>Save as insight…</button>
-      </div>
-      {editing && (
-        <div style={{ display: "flex", gap: 8 }}>
-          <input placeholder="Insight name" value={name} onChange={e => setName(e.target.value)} autoFocus />
-          <button onClick={save}>Save</button>
-          <button onClick={() => setEditing(false)}>Cancel</button>
-        </div>
-      )}
-      {result && result.results && (
-        <div style={{ marginTop: 8, padding: 12, background: "var(--bg-card)", borderRadius: 8 }}>
-          {result.results.map((r: any, i: number) => (
-            <div key={i} style={{ marginBottom: 6 }}>
-              <strong>{r.label}</strong>: {r.data?.slice(0, 5).map((d: any) => `${d.interval}: ${d.count.toLocaleString()}`).join(", ")}
-              {(r.data?.length ?? 0) > 5 ? ` ... and ${r.data.length - 5} more` : ""}
-            </div>
-          ))}
-          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
-            {result.meta?.elapsed_ms}ms {result.meta?.cached ? "(cached)" : ""}
-          </div>
-        </div>
-      )}
-    </div>
+    <InsightBuilder token={token} onSave={save} />
     <h3>Saved ({insights.length})</h3>
     {insights.map(i => (
       <div key={i.id} className="row" style={{ padding: "6px 0", flexWrap: "wrap" }}>
         <span style={{ fontWeight: 600 }}>{i.name}</span>
-        <span className="did" style={{ marginLeft: 8 }}>{i.description}</span>
+        <span className="did" style={{ marginLeft: 8 }}>{i.query_ir?.kind ?? i.description}</span>
         {dashboards.length > 0 && (
           <select
             style={{ marginLeft: 12, fontSize: 12 }}

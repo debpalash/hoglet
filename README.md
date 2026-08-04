@@ -6,8 +6,10 @@ Point your existing PostHog SDK at Hoglet — change `api_host`, nothing else �
 it just works. No ClickHouse, no Kafka, no Redis, no Zookeeper. One static Rust
 binary that runs on a 1 vCPU / 1 GB box.
 
-> Status: pre-release, built in the open. Milestones 1 and 2 are done and tested;
-> see [`SPEC.md`](SPEC.md) for exactly what's built (✅), partial (◐), and planned (○).
+> Status: pre-release, built in the open. The ingest spine, query layer, data
+> model, auth, and dashboards are built and tested; see
+> [`spec/README.md`](spec/README.md) for exactly what's built (✅), partial (◐),
+> and planned (○), phase by phase.
 
 ## Why
 
@@ -59,7 +61,7 @@ Open `http://localhost:8000/` for the live dashboard.
 
 One binary, two lanes: a hot ingest path (capture → WAL → Parquet) that must
 never lose data, and a query lane (DuckDB, memory-capped) that can't starve it.
-Persons/identity/flags live in SQLite. Full map in [`SPEC.md`](SPEC.md);
+Persons/identity/flags live in SQLite. Full map in [`spec/README.md`](spec/README.md);
 compatibility contract in [`spec/wire-compat.md`](spec/wire-compat.md).
 
 ## Testing

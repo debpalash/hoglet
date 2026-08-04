@@ -50,13 +50,35 @@ where
     F: FnOnce(&QueryEngine) -> Result<T, QueryError> + Send + 'static,
     T: Serialize + Send + 'static,
 {
+    match run_json(state, f).await {
+        Ok(body) => json_response(body, "MISS"),
+        Err(code) => code.into_response(),
+    }
+}
+
+/// Same as `run`, but hands back the serialized bytes so the caller can cache
+/// them. A `Response` body is a stream — once it exists the bytes are gone, so
+/// anything that wants to keep a copy has to branch before that point.
+async fn run_json<T, F>(state: &ApiState, f: F) -> Result<Vec<u8>, StatusCode>
+where
+    F: FnOnce(&QueryEngine) -> Result<T, QueryError> + Send + 'static,
+    T: Serialize + Send + 'static,
+{
     let _permit = state.engine.acquire().await;
     let engine = state.engine.clone();
     match tokio::task::spawn_blocking(move || f(&engine)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(QueryError::TooManySteps)) => StatusCode::BAD_REQUEST.into_response(),
-        Ok(Err(_)) | Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Ok(v)) => serde_json::to_vec(&v).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Err(QueryError::TooManySteps)) => Err(StatusCode::BAD_REQUEST),
+        Ok(Err(_)) | Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+fn json_response(body: Vec<u8>, cache_status: &str) -> Response {
+    axum::http::Response::builder()
+        .header("content-type", "application/json")
+        .header("x-cache", cache_status)
+        .body(axum::body::Body::from(body))
+        .expect("static headers are always valid")
 }
 
 #[derive(Deserialize)]
@@ -116,43 +138,37 @@ struct QueryRequest {
     token: String,
     query: ir::Query,
     #[serde(default)]
-    #[allow(dead_code)]
     refresh: bool,
 }
 
 async fn query(State(s): State<ApiState>, Json(b): Json<QueryRequest>) -> Response {
-    // Check cache if refresh not requested
+    // The data version is part of the key, so a flush invalidates every entry
+    // for free — no explicit eviction, and a stale segment can never be served.
+    let key = s.cache.as_ref().map(|_| CacheKey {
+        token: b.token.clone(),
+        ir_hash: hash_ir(&serde_json::to_value(&b.query).unwrap_or_default()),
+        data_version: s.index.as_ref().map(|i| i.read_version()).unwrap_or(0),
+    });
+
     if !b.refresh {
-        if let Some(ref cache) = s.cache {
-            let version = s.index.as_ref().map(|i| i.read_version()).unwrap_or(0);
-            let key = CacheKey {
-                token: b.token.clone(),
-                ir_hash: hash_ir(&serde_json::to_value(&b.query).unwrap_or_default()),
-                data_version: version,
-            };
-            if let Some(cached) = cache.get(&key) {
-                return axum::http::Response::builder()
-                    .header("content-type", "application/json")
-                    .header("x-cache", "HIT")
-                    .body(axum::body::Body::from(cached))
-                    .unwrap();
+        if let (Some(cache), Some(key)) = (s.cache.as_ref(), key.as_ref()) {
+            if let Some(cached) = cache.get(key) {
+                return json_response(cached, "HIT");
             }
         }
     }
 
-    let state = s.clone();
     let query_ir = b.query.clone();
     let token = b.token.clone();
-    let _do_refresh = b.refresh;
-    let result = run(&state, move |e| e.run_ir(&query_ir, &token)).await;
-
-    // Cache successful responses
-    if result.status().is_success() && state.cache.is_some() {
-        // Can't easily extract body from an already-consumed response
-        // Cache miss — the next request will be a hit.
+    match run_json(&s, move |e| e.run_ir(&query_ir, &token)).await {
+        Ok(body) => {
+            if let (Some(cache), Some(key)) = (s.cache.as_ref(), key) {
+                cache.put(key, body.clone());
+            }
+            json_response(body, "MISS")
+        }
+        Err(code) => code.into_response(),
     }
-
-    result
 }
 
 #[cfg(test)]
@@ -222,5 +238,70 @@ mod tests {
         assert_eq!(parsed["meta"]["kind"], "trends");
         assert!(parsed["results"].is_array());
         assert!(!parsed["results"][0]["data"].as_array().unwrap().is_empty());
+    }
+
+    /// The cache is only worth having if the second identical query skips
+    /// DuckDB entirely — and `refresh: true` has to be able to bypass it.
+    #[tokio::test]
+    async fn repeated_query_is_served_from_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EventStore::open(dir.path().to_path_buf()).unwrap();
+        store.write_events(&[ev("pageview", "u1"), ev("pageview", "u2")]).unwrap();
+        let engine = Arc::new(crate::query::QueryEngine::new(dir.path().to_path_buf()));
+        let app = router(engine, Some(Arc::new(ResultCache::new(8))), None);
+
+        let body = json!({
+            "token": "phc_t",
+            "query": {
+                "kind": "Trends",
+                "series": [{
+                    "event": { "type": "name", "value": "pageview" },
+                    "math": { "type": "total" }
+                }],
+                "filters": { "op": "AND", "values": [] },
+                "range": {},
+                "interval": "Day"
+            }
+        });
+
+        let send = |app: Router, refresh: bool| {
+            let mut b = body.clone();
+            b["refresh"] = json!(refresh);
+            async move {
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri("/api/query")
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&b).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let cache = resp
+                    .headers()
+                    .get("x-cache")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                (status, cache, bytes)
+            }
+        };
+
+        let (status, cache, first) = send(app.clone(), false).await;
+        assert_eq!(status, 200);
+        assert_eq!(cache, "MISS");
+
+        let (status, cache, second) = send(app.clone(), false).await;
+        assert_eq!(status, 200);
+        assert_eq!(cache, "HIT", "identical query should not re-run DuckDB");
+        assert_eq!(first, second, "a cache hit must be byte-identical to the miss");
+
+        let (status, cache, _) = send(app, true).await;
+        assert_eq!(status, 200);
+        assert_eq!(cache, "MISS", "refresh must bypass the cache");
     }
 }

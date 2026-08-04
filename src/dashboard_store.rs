@@ -310,13 +310,17 @@ impl DashboardStore {
     }
 
     pub fn get_shared(&self, share_token: &str) -> Result<SharedObject, DashboardError> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT object_type, object_id, token FROM share_links WHERE token = ?1",
-        )?;
-        let (obj_type, obj_id, stok): (String, String, String) = stmt
-            .query_row([share_token], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .map_err(|_| DashboardError::NotFound)?;
+        // Scoped so the lock is released before the lookups below: `get_dashboard`
+        // and `get_insight` take the same mutex, and it is not reentrant — holding
+        // it across the call deadlocks the thread against itself.
+        let (obj_type, obj_id, stok): (String, String, String) = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare_cached(
+                "SELECT object_type, object_id, token FROM share_links WHERE token = ?1",
+            )?;
+            stmt.query_row([share_token], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .map_err(|_| DashboardError::NotFound)?
+        };
 
         match obj_type.as_str() {
             "dashboard" => {

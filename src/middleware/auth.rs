@@ -61,8 +61,11 @@ pub async fn require_auth(
         return next.run(request).await;
     }
 
-    // Only gate /api/* and /dashboard.
-    if !path.starts_with("/api/") && path != "/dashboard" && !path.starts_with("/dashboard") && path != "/" {
+    // Only gate /api/*. The dashboard shell itself is public: it holds no data,
+    // and the SPA renders its own setup/login screen off a 401 from /api/auth/me.
+    // Redirecting the page here would strand the browser — there is no static
+    // login page to redirect to, the login form lives inside the bundle.
+    if !path.starts_with("/api/") {
         return next.run(request).await;
     }
 
@@ -86,22 +89,90 @@ pub async fn require_auth(
         }
     }
 
-    // For page requests, redirect to setup or login.
-    if path == "/" || path.starts_with("/dashboard") {
-        if store.is_empty().unwrap_or(false) {
-            return axum::http::Response::builder()
-                .status(StatusCode::FOUND)
-                .header(header::LOCATION, "/setup.html")
-                .body(axum::body::Body::empty())
-                .unwrap();
-        }
-        return axum::http::Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::LOCATION, "/login.html")
-            .body(axum::body::Body::empty())
-            .unwrap();
+    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, body::Body, http::Request, routing::get};
+    use tower::ServiceExt;
+
+    /// A router shaped like the real one: the dashboard shell, one gated API
+    /// route, and the capture edge, all behind the middleware.
+    fn app(store: Arc<AuthStore>) -> Router {
+        Router::new()
+            .route("/", get(|| async { "dashboard shell" }))
+            .route("/dashboard", get(|| async { "dashboard shell" }))
+            .route("/api/stats", get(|| async { "stats" }))
+            .route("/api/auth/me", get(|| async { "me" }))
+            .route("/e/", get(|| async { "captured" }))
+            .layer(axum::middleware::from_fn_with_state(
+                AuthLayerState { store: Some(store) },
+                require_auth,
+            ))
     }
 
-    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    async fn status(store: Arc<AuthStore>, uri: &str) -> StatusCode {
+        app(store)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn empty_store() -> Arc<AuthStore> {
+        Arc::new(AuthStore::open_in_memory().expect("in-memory auth store"))
+    }
+
+    fn store_with_user() -> Arc<AuthStore> {
+        let store = empty_store();
+        store.setup("a@b.c", "correct horse battery", "Org").expect("setup");
+        store
+    }
+
+    /// The login and setup forms live inside the JS bundle, so the shell must
+    /// load for a visitor with no session — there is no static page to redirect
+    /// to, and a redirect here strands every first-time browser on a 404.
+    #[tokio::test]
+    async fn dashboard_shell_is_public() {
+        for store in [empty_store(), store_with_user()] {
+            assert_eq!(status(store.clone(), "/").await, StatusCode::OK);
+            assert_eq!(status(store, "/dashboard").await, StatusCode::OK);
+        }
+    }
+
+    /// The shell being public buys nothing if the data behind it leaks: the
+    /// SPA decides between its setup and login screens off exactly this 401.
+    #[tokio::test]
+    async fn api_is_gated_without_a_session() {
+        let store = store_with_user();
+        assert_eq!(status(store.clone(), "/api/stats").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status(store, "/api/auth/me").await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn session_cookie_opens_the_api() {
+        let store = store_with_user();
+        let (_, sid) = store.login("a@b.c", "correct horse battery").expect("login");
+        let code = app(store)
+            .oneshot(
+                Request::get("/api/stats")
+                    .header(header::COOKIE, format!("{COOKIE_NAME}={sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// Ingest must never depend on dashboard auth — SDKs carry a project token,
+    /// not a session.
+    #[tokio::test]
+    async fn capture_edge_is_never_gated() {
+        assert_eq!(status(store_with_user(), "/e/").await, StatusCode::OK);
+    }
 }
 

@@ -48,13 +48,24 @@ fn default_interval() -> Interval {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
+/// Aliases are deserialize-only, so the wire output and the generated TS types
+/// are unchanged. They exist because `meta.kind` comes back lowercase
+/// ("trends"), and an API that will not accept the spelling it just emitted is
+/// a trap for anyone hand-writing a query.
 pub enum QueryKind {
+    #[serde(alias = "trends")]
     Trends,
+    #[serde(alias = "funnels")]
     Funnels,
+    #[serde(alias = "retention")]
     Retention,
+    #[serde(alias = "lifecycle")]
     Lifecycle,
+    #[serde(alias = "stickiness")]
     Stickiness,
+    #[serde(alias = "actors")]
     Actors,
+    #[serde(alias = "sql")]
     Sql,
 }
 
@@ -169,9 +180,9 @@ impl Default for PropertyGroup {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub enum GroupOp {
-    #[serde(rename = "AND")]
+    #[serde(rename = "AND", alias = "and")]
     And,
-    #[serde(rename = "OR")]
+    #[serde(rename = "OR", alias = "or")]
     Or,
 }
 
@@ -291,9 +302,13 @@ pub enum LastN {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub enum Interval {
+    #[serde(alias = "hour")]
     Hour,
+    #[serde(alias = "day")]
     Day,
+    #[serde(alias = "week")]
     Week,
+    #[serde(alias = "month")]
     Month,
 }
 
@@ -581,5 +596,39 @@ mod tests {
         let parsed: Query = serde_json::from_str(&json).unwrap();
         let rejson = serde_json::to_string_pretty(&parsed).unwrap();
         assert_eq!(json, rejson);
+    }
+
+    /// `meta.kind` comes back lowercase, so lowercase has to parse. Both
+    /// spellings must land on the same variant, and the canonical spelling must
+    /// still be what we emit — the generated TS types describe the output.
+    #[test]
+    fn lowercase_spellings_are_accepted() {
+        assert!(matches!(
+            serde_json::from_str::<QueryKind>("\"trends\"").unwrap(),
+            QueryKind::Trends
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Interval>("\"day\"").unwrap(),
+            Interval::Day
+        ));
+        assert!(matches!(
+            serde_json::from_str::<GroupOp>("\"and\"").unwrap(),
+            GroupOp::And
+        ));
+
+        // Canonical spellings keep working...
+        assert!(matches!(
+            serde_json::from_str::<QueryKind>("\"Trends\"").unwrap(),
+            QueryKind::Trends
+        ));
+        assert!(matches!(
+            serde_json::from_str::<GroupOp>("\"AND\"").unwrap(),
+            GroupOp::And
+        ));
+
+        // ...and remain what we serialize, so the TS types stay honest.
+        assert_eq!(serde_json::to_string(&QueryKind::Trends).unwrap(), "\"Trends\"");
+        assert_eq!(serde_json::to_string(&Interval::Day).unwrap(), "\"Day\"");
+        assert_eq!(serde_json::to_string(&GroupOp::And).unwrap(), "\"AND\"");
     }
 }

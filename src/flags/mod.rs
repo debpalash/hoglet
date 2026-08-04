@@ -50,14 +50,18 @@ fn op_exact() -> String {
 pub struct Conditions {
     #[serde(default)]
     pub properties: Vec<PropertyFilter>,
+    #[serde(default)]
+    pub cohort_ids: Vec<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvaluatedFlag {
     pub key: String,
     pub enabled: bool,
-    /// Some(variant) for a matched multivariate flag; None for a boolean flag.
     pub variant: Option<String>,
+    pub payload: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
@@ -67,6 +71,7 @@ pub struct FlagDef {
     pub active: bool,
     pub rollout_percentage: f64,
     pub variants: Vec<Variant>,
+    pub payload: Option<String>,
 }
 
 pub struct FlagStore {
@@ -168,13 +173,10 @@ impl FlagStore {
             .into_iter()
             .map(|f| FlagDef {
                 key: f.key,
-                // active_only=false includes inactive; re-read active via a
-                // second lightweight query would be wasteful, so derive from
-                // a fresh load below is avoided — instead we mark active by
-                // whether it appears in the active set.
                 active: true,
                 rollout_percentage: f.rollout,
                 variants: f.variants,
+                payload: f.conditions.and_then(|c| c.payload),
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -203,52 +205,39 @@ impl FlagStore {
         token: &str,
         distinct_id: &str,
         person_properties: &Map<String, Value>,
+        cohort_check: &dyn Fn(&str, &str) -> bool,
+        first_seen_key: Option<&str>,
     ) -> Vec<EvaluatedFlag> {
+        let bucket_key = first_seen_key.unwrap_or(distinct_id);
         self.load(token, true)
             .into_iter()
-            .map(|f| evaluate_one(&f, distinct_id, person_properties))
+            .map(|f| evaluate_one(&f, bucket_key, person_properties, cohort_check))
             .collect()
     }
 }
 
 fn evaluate_one(
     f: &StoredFlag,
-    distinct_id: &str,
+    bucket_key: &str,
     person_properties: &Map<String, Value>,
+    cohort_check: &dyn Fn(&str, &str) -> bool,
 ) -> EvaluatedFlag {
-    // Conditions gate first: if any property filter fails, the flag is off.
-    if let Some(cond) = &f.conditions
-        && !cond
-            .properties
-            .iter()
-            .all(|p| match_filter(person_properties.get(&p.key), &p.operator, &p.value))
-    {
-        return EvaluatedFlag {
-            key: f.key.clone(),
-            enabled: false,
-            variant: None,
-        };
+    let payload = f.conditions.as_ref().and_then(|c| c.payload.clone());
+    if let Some(cond) = &f.conditions {
+        if !cond.properties.iter().all(|p| match_filter(person_properties.get(&p.key), &p.operator, &p.value)) {
+            return EvaluatedFlag { key: f.key.clone(), enabled: false, variant: None, payload };
+        }
+        if !cond.cohort_ids.iter().all(|cid| cohort_check(bucket_key, cid)) {
+            return EvaluatedFlag { key: f.key.clone(), enabled: false, variant: None, payload };
+        }
     }
 
-    if !in_rollout(&f.key, distinct_id, f.rollout) {
-        return EvaluatedFlag {
-            key: f.key.clone(),
-            enabled: false,
-            variant: None,
-        };
+    if !in_rollout(&f.key, bucket_key, f.rollout) {
+        return EvaluatedFlag { key: f.key.clone(), enabled: false, variant: None, payload };
     }
 
-    // In rollout. Pick a variant if the flag is multivariate.
-    let variant = if f.variants.is_empty() {
-        None
-    } else {
-        Some(pick_variant(&f.key, distinct_id, &f.variants))
-    };
-    EvaluatedFlag {
-        key: f.key.clone(),
-        enabled: true,
-        variant,
-    }
+    let variant = if f.variants.is_empty() { None } else { Some(pick_variant(&f.key, bucket_key, &f.variants)) };
+    EvaluatedFlag { key: f.key.clone(), enabled: true, variant, payload }
 }
 
 /// PostHog's consistent-hash bucketing. A user's fraction is stable across
@@ -321,7 +310,7 @@ mod tests {
         v.as_object().cloned().unwrap_or_default()
     }
     fn eval(s: &FlagStore, did: &str) -> Vec<EvaluatedFlag> {
-        s.evaluate("phc_t", did, &Map::new())
+        s.evaluate("phc_t", did, &Map::new(), &|_, _| true, None)
     }
 
     #[test]
@@ -330,7 +319,7 @@ mod tests {
         s.upsert("phc_t", "new-ui", true, 100.0).unwrap();
         assert_eq!(
             eval(&s, "anyone"),
-            vec![EvaluatedFlag { key: "new-ui".into(), enabled: true, variant: None }]
+            vec![EvaluatedFlag { key: "new-ui".into(), enabled: true, variant: None, payload: None }]
         );
     }
 
@@ -418,7 +407,7 @@ mod tests {
             true,
             100.0,
             &[],
-            Some(&Conditions {
+            Some(&Conditions { cohort_ids: vec![], payload: None,
                 properties: vec![PropertyFilter {
                     key: "plan".into(),
                     operator: "exact".into(),
@@ -428,12 +417,12 @@ mod tests {
         )
         .unwrap();
         // pro user: on. free user: off.
-        let pro = s.evaluate("phc_t", "u", &props(json!({"plan": "pro"})));
+        let pro = s.evaluate("phc_t", "u", &props(json!({"plan": "pro"})), &|_, _| true, None);
         assert!(pro[0].enabled);
-        let free = s.evaluate("phc_t", "u", &props(json!({"plan": "free"})));
+        let free = s.evaluate("phc_t", "u", &props(json!({"plan": "free"})), &|_, _| true, None);
         assert!(!free[0].enabled);
         // missing property: off.
-        let none = s.evaluate("phc_t", "u", &Map::new());
+        let none = s.evaluate("phc_t", "u", &Map::new(), &|_, _| true, None);
         assert!(!none[0].enabled);
     }
 
@@ -446,7 +435,7 @@ mod tests {
             true,
             100.0,
             &[],
-            Some(&Conditions {
+            Some(&Conditions { cohort_ids: vec![], payload: None,
                 properties: vec![PropertyFilter {
                     key: "spend".into(),
                     operator: "gt".into(),
@@ -455,8 +444,8 @@ mod tests {
             }),
         )
         .unwrap();
-        assert!(s.evaluate("phc_t", "u", &props(json!({"spend": 500})))[0].enabled);
-        assert!(!s.evaluate("phc_t", "u", &props(json!({"spend": 50})))[0].enabled);
+        assert!(s.evaluate("phc_t", "u", &props(json!({"spend": 500})), &|_, _| true, None)[0].enabled);
+        assert!(!s.evaluate("phc_t", "u", &props(json!({"spend": 50})), &|_, _| true, None)[0].enabled);
     }
 
     #[test]

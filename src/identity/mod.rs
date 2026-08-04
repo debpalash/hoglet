@@ -40,7 +40,7 @@ impl From<rusqlite::Error> for IdentityError {
 
 /// Identity schema version (spec/README.md "Format evolution"). Migrations run
 /// forward-only at open; bump and add a step when the schema changes.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS persons (
@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS persons (
     token TEXT NOT NULL,
     created_at TEXT NOT NULL,
     is_identified INTEGER NOT NULL DEFAULT 0,
-    properties TEXT NOT NULL DEFAULT '{}'
+    properties TEXT NOT NULL DEFAULT '{}',
+    first_seen_key TEXT
 );
 CREATE TABLE IF NOT EXISTS distinct_ids (
     token TEXT NOT NULL,
@@ -185,6 +186,22 @@ impl IdentityStore {
             .as_object()
             .cloned()
     }
+
+    /// Returns the stable bucketing key for this person, used by flag evaluation
+    /// to maintain experience continuity across identify events.
+    pub fn first_seen_key_for(&self, token: &str, distinct_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT p.first_seen_key FROM persons p
+             JOIN distinct_ids d ON d.person_id = p.id
+             WHERE d.token=?1 AND d.distinct_id=?2",
+            params![token, distinct_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
 }
 
 /// Forward-only migration by `user_version`. A newer binary opening an older
@@ -197,7 +214,16 @@ fn migrate(conn: &Connection) -> Result<(), IdentityError> {
              downgrade unsupported"
         )));
     }
-    // Future steps: `if current < 2 { ...; }` etc.
+    if current < 2 {
+        let col_count: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('persons') WHERE name='first_seen_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        if col_count == 0 {
+            conn.execute_batch("ALTER TABLE persons ADD COLUMN first_seen_key TEXT;")?;
+        }
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -218,9 +244,13 @@ fn ensure_person(
     {
         return Ok(id);
     }
+    // Generate a stable first_seen_key for this new person. For anonymous
+    // persons, the distinct_id itself is the most stable key (it won't change
+    // until identify). After identify, the merge function transfers it.
+    let first_key = distinct_id.to_string();
     tx.execute(
-        "INSERT INTO persons (token, created_at, is_identified) VALUES (?1, ?2, 0)",
-        params![token, event.timestamp.to_rfc3339()],
+        "INSERT INTO persons (token, created_at, is_identified, first_seen_key) VALUES (?1, ?2, 0, ?3)",
+        params![token, event.timestamp.to_rfc3339(), first_key],
     )?;
     let person_id = tx.last_insert_rowid();
     tx.execute(
@@ -275,15 +305,15 @@ fn merge(
         }
     }
 
-    let (winner_props, winner_created): (String, String) = tx.query_row(
-        "SELECT properties, created_at FROM persons WHERE id=?1",
+    let (winner_props, winner_created, winner_key): (String, String, Option<String>) = tx.query_row(
+        "SELECT properties, created_at, first_seen_key FROM persons WHERE id=?1",
         params![winner],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let (loser_props, loser_created): (String, String) = tx.query_row(
-        "SELECT properties, created_at FROM persons WHERE id=?1",
+    let (loser_props, loser_created, loser_key): (String, String, Option<String>) = tx.query_row(
+        "SELECT properties, created_at, first_seen_key FROM persons WHERE id=?1",
         params![loser],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
 
     // {...loser, ...winner} — winner wins conflicts.
@@ -298,15 +328,19 @@ fn merge(
         winner_created
     };
 
+    // Transfer first_seen_key: winner keeps its own, inherits loser's if it lacks one
+    let key_to_keep = winner_key.or(loser_key);
+
     tx.execute(
         "UPDATE distinct_ids SET person_id=?1 WHERE person_id=?2",
         params![winner, loser],
     )?;
     tx.execute(
-        "UPDATE persons SET properties=?1, created_at=?2 WHERE id=?3",
+        "UPDATE persons SET properties=?1, created_at=?2, first_seen_key=?3 WHERE id=?4",
         params![
             serde_json::Value::Object(merged).to_string(),
             created_at,
+            key_to_keep,
             winner
         ],
     )?;

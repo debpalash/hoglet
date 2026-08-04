@@ -115,14 +115,14 @@ retried; SQLite busy → identity retried, self-heals from log; query OOM/timeou
 |---|---|---|---|
 | `README.md` (this) | Index, architecture, roadmap | — | ✅ living |
 | `wire-compat.md` | PostHog wire contract (capture, config, flags shapes, retry) | P0 | ✅ needs P8 additions |
-| `query-layer.md` | Query IR, SQL compiler, /api/query, caching, oracle | P1 | ○ to write |
-| `data-model.md` | Properties catalog, sessions, persons/profiles, groups, enrichment | P2 | ○ to write |
-| `insights.md` | Trends/funnels/retention/lifecycle/stickiness/paths templates + actor drill-down | P3 | ○ to write |
-| `auth.md` | Users, orgs/projects/roles, API keys, dashboard auth | P4 | ○ to write |
-| `cohorts-flags.md` | Cohorts (static+behavioral), flag targeting/payloads/continuity/local-eval | P5 | ○ to write |
-| `dashboards.md` | Saved insights, dashboard grid, sharing, insight-builder UI | P6 | ○ to write |
-| `scale.md` | Partitioning, rollups, session table, values catalog, cache, benchmark | P7 | ○ to write |
-| `launch.md` | Install story, demo, measured numbers, docs site | P8 | ○ to write |
+| `query-layer.md` | Query IR, SQL compiler, /api/query, caching, oracle | P1 | ✅ built |
+| `data-model.md` | Properties catalog, sessions, persons/profiles, groups, enrichment | P2 | ✅ built |
+| `insights.md` | Trends/funnels/retention/lifecycle/stickiness/paths templates + actor drill-down | P3 | ◐ core built, lifecycle/stickiness deferred |
+| `auth.md` | Users, orgs/projects/roles, API keys, dashboard auth | P4 | ✅ built |
+| `cohorts-flags.md` | Cohorts (static+behavioral), flag targeting/payloads/continuity/local-eval | P5 | ◐ core built, continuity deferred |
+| `dashboards.md` | Saved insights, dashboard grid, sharing, insight-builder UI | P6 | ◐ backend built, insight builder deferred |
+| `scale.md` | Partitioning, rollups, session table, values catalog, cache, benchmark | P7 | ◐ cache + index built, partitioning deferred |
+| `launch.md` | Install story, demo, measured numbers, docs site | P8 | ✅ spec written, boss-gated |
 
 Writing a phase's spec is that phase's first task. The blueprint sections below
 are the brief each spec file expands.

@@ -32,7 +32,39 @@ async fn main() {
     let retention_days = std::env::var("HOGLET_RETENTION_DAYS")
         .ok()
         .and_then(|v| v.parse().ok());
-    hoglet::flush::spawn(wal.clone(), store.clone(), retention_days);
+    let catalog = hoglet::catalog::CatalogStore::open(&data_dir.join("catalog.db"))
+        .ok()
+        .map(std::sync::Arc::new);
+
+    let session = hoglet::session::SessionStore::open(&data_dir.join("sessions.db"))
+        .ok()
+        .map(std::sync::Arc::new);
+
+    let session_for_demo = session.clone();
+
+    hoglet::flush::spawn(
+        wal.clone(),
+        store.clone(),
+        catalog.clone(),
+        session,
+        retention_days,
+    );
+
+    let auth = hoglet::auth::AuthStore::open(&data_dir.join("auth.db"))
+        .ok()
+        .map(std::sync::Arc::new);
+
+    let is_first_run = auth
+        .as_ref()
+        .map(|a| a.is_empty().unwrap_or(false))
+        .unwrap_or(true);
+    if is_first_run {
+        tracing::info!("first run detected — visit /dashboard to set up your account");
+    }
+
+    let dash = hoglet::dashboard_store::DashboardStore::open(&data_dir.join("dashboards.db"))
+        .ok()
+        .map(std::sync::Arc::new);
     let identity = std::sync::Arc::new(
         hoglet::identity::IdentityStore::open(&data_dir.join("identity.db"))
             .expect("cannot open identity store"),
@@ -69,6 +101,15 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("cannot bind {addr}: {e}"));
+    // Seed demo data if HOGLET_DEMO=1
+    hoglet::demo::seed_if_demo(
+        &store,
+        &flag_store,
+        dash.as_deref(),
+        catalog.as_ref(),
+        session_for_demo.as_ref(),
+    );
+
     // Stores are open and the flusher is running: declare ready so /ready
     // starts answering 200.
     readiness.mark_ready();
@@ -78,9 +119,35 @@ async fn main() {
         .ok()
         .filter(|s| !s.is_empty())
         .map(std::sync::Arc::new);
+
+    let catalog = hoglet::catalog::CatalogStore::open(&data_dir.join("catalog.db"))
+        .ok()
+        .map(std::sync::Arc::new);
+
+    let _session = hoglet::session::SessionStore::open(&data_dir.join("sessions.db"))
+        .ok()
+        .map(std::sync::Arc::new);
+
+    let file_index = std::sync::Arc::new(hoglet::file_index::FileIndex::new());
+    file_index.rebuild_from_dir(&data_dir.join("events"));
+
+    let result_cache = std::sync::Arc::new(hoglet::cache::ResultCache::new(200));
+
     axum::serve(
         listener,
-        hoglet::app_with_state(state, readiness, engine, flag_store, store, admin_token),
+        hoglet::app_with_state(
+            state,
+            readiness,
+            engine,
+            flag_store,
+            store,
+            admin_token,
+            catalog,
+            auth,
+            dash,
+            Some(result_cache),
+            Some(file_index),
+        ),
     )
         .with_graceful_shutdown(async {
             tokio::signal::ctrl_c().await.ok();

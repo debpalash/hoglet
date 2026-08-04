@@ -17,6 +17,7 @@ use axum::{
 use serde_json::{Map, Value, json};
 
 use crate::flags::FlagStore;
+use crate::identity::IdentityStore;
 use crate::token;
 
 #[derive(serde::Deserialize, Default)]
@@ -28,18 +29,19 @@ pub struct FlagsQuery {
 #[derive(Clone)]
 pub struct FlagsState {
     pub store: Arc<FlagStore>,
+    pub identity: Option<Arc<IdentityStore>>,
 }
 
-pub fn router(store: Arc<FlagStore>) -> Router {
+pub fn router(store: Arc<FlagStore>, identity: Arc<IdentityStore>) -> Router {
     Router::new()
         .route("/flags", post(flags))
         .route("/flags/", post(flags))
         .route("/decide", post(flags))
         .route("/decide/", post(flags))
-        // Dashboard: list flag definitions (read-only).
         .route("/api/flags", get(list_flags))
-        .with_state(FlagsState { store })
-}
+        .route("/flags/definitions", get(local_eval_definitions))
+        .with_state(FlagsState { store, identity: Some(identity) })
+    }
 
 #[derive(serde::Deserialize)]
 struct ListQuery {
@@ -99,7 +101,11 @@ async fn flags(
         .cloned()
         .unwrap_or_default();
 
-    let evaluated = state.store.evaluate(raw_token, distinct_id, &person_properties);
+    let first_seen_key = state.identity.as_ref()
+        .and_then(|id| id.first_seen_key_for(raw_token, distinct_id));
+    let evaluated = state.store.evaluate(
+        raw_token, distinct_id, &person_properties, &|_, _| true, first_seen_key.as_deref()
+    );
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // A flag's value is its variant string when multivariate, else its bool.
@@ -171,6 +177,26 @@ async fn flags(
     Json(body).into_response()
 }
 
+async fn local_eval_definitions(
+    State(state): State<FlagsState>,
+    Query(q): Query<ListQuery>,
+) -> Response {
+    let defs = state.store.list(&q.token);
+    Json(serde_json::json!({
+        "flags": defs.into_iter().map(|d: crate::flags::FlagDef| serde_json::json!({
+            "key": d.key,
+            "enabled": d.active,
+            "variants": d.variants.iter().map(|v| serde_json::json!({
+                "key": v.key,
+                "rollout_percentage": v.rollout,
+            })).collect::<Vec<_>>(),
+            "filters": { "groups": serde_json::json!([]) },
+            "rollout_percentage": d.rollout_percentage,
+            "payload": d.payload,
+        })).collect::<Vec<_>>(),
+    })).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +209,7 @@ mod tests {
         let store = Arc::new(FlagStore::in_memory().unwrap());
         store.upsert("phc_t", "new-ui", true, 100.0).unwrap();
         store.upsert("phc_t", "beta", true, 0.0).unwrap();
-        router(store)
+        router(store, std::sync::Arc::new(crate::identity::IdentityStore::in_memory().unwrap()))
     }
 
     async fn post(app: Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
@@ -229,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn empty_store_returns_empty_not_error() {
         let store = Arc::new(FlagStore::in_memory().unwrap());
-        let (status, body) = post(router(store), "/flags/?v=2", BODY).await;
+        let (status, body) = post(router(store, std::sync::Arc::new(crate::identity::IdentityStore::in_memory().unwrap())), "/flags/?v=2", BODY).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["feature_flags"].as_object().unwrap().is_empty());
     }

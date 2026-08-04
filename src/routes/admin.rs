@@ -223,7 +223,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         // The flag is now evaluable.
-        assert!(flags.evaluate("phc_t", "u1", &serde_json::Map::new())[0].enabled);
+        assert!(flags.evaluate("phc_t", "u1", &serde_json::Map::new(), &|_, _| true, None)[0].enabled);
     }
 
     #[tokio::test]

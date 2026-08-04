@@ -45,6 +45,41 @@ export const api = {
       return null;
     }
   },
+  me: () => getJson<{ user: { id: string; email: string; name: string } | null }>("/api/auth/me"),
+  login: async (email: string, password: string) => {
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!r.ok) return null;
+    return r.json();
+  },
+  setup: async (email: string, password: string, org_name: string) => {
+    const r = await fetch("/api/auth/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password, org_name }),
+    });
+    if (!r.ok) return null;
+    return r.json();
+  },
+  logout: () => fetch("/api/auth/logout", { method: "POST" }),
 };
 
 export type { Stats, EventCount, TrendPoint, FunnelStep, RecentEvent, FlagDef };
+
+export interface SavedInsight {
+  id: string; token: string; name: string; description: string;
+  query_ir: any; created_by: string; created_at: number; updated_at: number;
+}
+
+export interface DashboardTile {
+  insight_id: string; x: number; y: number; w: number; h: number;
+  insight?: SavedInsight;
+}
+
+export interface Dashboard {
+  id: string; token: string; name: string; tiles: DashboardTile[];
+  created_by: string; created_at: number;
+}

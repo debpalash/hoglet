@@ -30,6 +30,10 @@ mime_guess = "2"
 ts-rs = "10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+woothee = "0.13"
+argon2 = "0.5"
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

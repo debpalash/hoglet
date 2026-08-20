@@ -8,8 +8,10 @@
 pub mod decompress;
 pub mod event;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
@@ -17,7 +19,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use axum::body::Bytes;
 use chrono::Utc;
 use serde_json::json;
 
@@ -25,13 +26,94 @@ use crate::identity::IdentityStore;
 use crate::metrics::Metrics;
 use crate::ratelimit::RateLimiter;
 use crate::registry::{Decision, Registry};
-use crate::sink::EventSink;
+use crate::sink::{AuthorizedEventBatch, EventSink};
+
+/// A project approved for capture.
+///
+/// New control-plane authorization always supplies `project_id`. The legacy
+/// registry adapter cannot, which is why the field is optional until the
+/// compatibility ingest path is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedCapture {
+    pub project_id: Option<String>,
+}
+
+/// Capture authorization is deliberately fail-closed at the HTTP edge.
+///
+/// Both variants become a 401 so SDKs retain the established no-retry
+/// behavior. `Unavailable` exists so adapters can preserve useful diagnostics
+/// without leaking control-plane failures into the wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureAuthorizationError {
+    Rejected,
+    Unavailable,
+}
+
+/// The only project-authentication dependency visible to capture handlers.
+#[async_trait::async_trait]
+pub trait CaptureAuthorizer: Send + Sync {
+    async fn authorize(&self, token: &str) -> Result<AuthorizedCapture, CaptureAuthorizationError>;
+}
+
+/// Fail-closed adapter for authoritative `control.db` project access.
+pub struct ProjectAccessCaptureAuthorizer {
+    access: crate::control::ProjectAccess,
+}
+
+impl ProjectAccessCaptureAuthorizer {
+    pub fn new(access: crate::control::ProjectAccess) -> Self {
+        Self { access }
+    }
+}
+
+#[async_trait::async_trait]
+impl CaptureAuthorizer for ProjectAccessCaptureAuthorizer {
+    async fn authorize(&self, token: &str) -> Result<AuthorizedCapture, CaptureAuthorizationError> {
+        match self.access.authorize_capture(token).await {
+            Ok(project) => Ok(AuthorizedCapture {
+                project_id: project.project_id,
+            }),
+            Err(crate::control::AccessError::InvalidToken)
+            | Err(crate::control::AccessError::Unauthorized) => {
+                Err(CaptureAuthorizationError::Rejected)
+            }
+            Err(error) => {
+                tracing::error!(?error, "capture authorization unavailable");
+                Err(CaptureAuthorizationError::Unavailable)
+            }
+        }
+    }
+}
+
+/// Compatibility adapter for legacy stores and isolated capture tests.
+///
+/// This preserves the registry's historical open mode. Production callers
+/// must opt into it explicitly; the authoritative adapter above never opens.
+pub struct LegacyRegistryCaptureAuthorizer {
+    registry: Arc<Registry>,
+}
+
+impl LegacyRegistryCaptureAuthorizer {
+    pub fn new(registry: Arc<Registry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait::async_trait]
+impl CaptureAuthorizer for LegacyRegistryCaptureAuthorizer {
+    async fn authorize(&self, token: &str) -> Result<AuthorizedCapture, CaptureAuthorizationError> {
+        match self.registry.check(token) {
+            Decision::Accept => Ok(AuthorizedCapture { project_id: None }),
+            Decision::Reject => Err(CaptureAuthorizationError::Rejected),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct CaptureState {
     pub sink: Arc<dyn EventSink>,
     pub identity: Arc<IdentityStore>,
-    pub registry: Arc<Registry>,
+    pub authorizer: Arc<dyn CaptureAuthorizer>,
     pub limiter: Arc<RateLimiter>,
     pub metrics: Arc<Metrics>,
 }
@@ -110,28 +192,52 @@ async fn capture(
 
     // Empty after filtering is still success — never make clients retry.
     if !batch.events.is_empty() {
-        // Token authenticity (spec/README.md "Security and tenancy"): shape was
-        // checked at parse; the registry adds project authenticity. Open
-        // mode (no projects) accepts any valid token.
-        if let Some(first) = batch.events.first()
-            && state.registry.check(&first.token) == Decision::Reject
-        {
-            state.metrics.inc_rejected();
-            return StatusCode::UNAUTHORIZED.into_response();
+        // Shape was checked during parsing. Authenticate every distinct token
+        // before applying rate limits or making any durable write; a batch may
+        // never inherit the first event's project authorization.
+        let mut token_counts = BTreeMap::<&str, u32>::new();
+        for event in &batch.events {
+            let count = token_counts.entry(event.token.as_str()).or_default();
+            *count = count.saturating_add(1);
         }
-        // Rate limit per token; 429 is retry-safe on the SDK's backoff.
-        if let Some(first) = batch.events.first()
-            && !state
-                .limiter
-                .allow(&first.token, batch.events.len() as u32, now.timestamp())
-        {
-            state.metrics.inc_rejected();
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        let mut project_ids_by_token = BTreeMap::new();
+        for token in token_counts.keys() {
+            match state.authorizer.authorize(token).await {
+                Ok(authorized) => {
+                    if let Some(project_id) = authorized.project_id {
+                        project_ids_by_token.insert((*token).to_owned(), project_id);
+                    }
+                }
+                Err(_) => {
+                    state.metrics.inc_rejected();
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+            }
         }
+        // Rate limit each authorized project independently; 429 is retry-safe
+        // on the SDK's backoff.
+        for (token, count) in token_counts {
+            if !state.limiter.allow(token, count, now.timestamp()) {
+                state.metrics.inc_rejected();
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
+        }
+        // `historical_migration` is an offline-import authority, never a wire
+        // property. A client cannot elevate an ordinary capture batch by
+        // placing this implementation detail in its JSON body.
+        let historical_migration = false;
         let events = batch.events;
         let n = events.len() as u64;
         state.metrics.inc_captured(n);
-        match state.sink.append(events.clone()).await {
+        match state
+            .sink
+            .append(AuthorizedEventBatch {
+                events: events.clone(),
+                project_ids_by_token,
+                historical_migration,
+            })
+            .await
+        {
             Ok(()) => state.metrics.inc_acked(n),
             Err(crate::sink::SinkError::Retryable) => {
                 state.metrics.inc_sink_errors();
@@ -146,13 +252,17 @@ async fn capture(
         // rebuildable from the event log, so a failure here logs rather
         // than failing an already-durable batch.
         let identity = state.identity.clone();
-        tokio::task::spawn_blocking(move || {
+        if let Err(error) = tokio::task::spawn_blocking(move || {
             for event in &events {
                 if let Err(e) = identity.process(event) {
                     tracing::error!("identity processing failed: {e:?}");
                 }
             }
-        });
+        })
+        .await
+        {
+            tracing::error!(?error, "identity projection task failed");
+        }
     }
 
     if beacon {
@@ -175,12 +285,26 @@ mod tests {
     use std::io::Write;
     use tower::ServiceExt;
 
+    #[derive(Default)]
+    struct BatchSink {
+        batches: std::sync::Mutex<Vec<AuthorizedEventBatch>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for BatchSink {
+        async fn append(&self, batch: AuthorizedEventBatch) -> Result<(), crate::sink::SinkError> {
+            self.batches.lock().unwrap().push(batch);
+            Ok(())
+        }
+    }
+
     fn app_with_sink() -> (Router, Arc<MemorySink>) {
         let sink = Arc::new(MemorySink::default());
+        let registry = Arc::new(Registry::in_memory().unwrap());
         let state = CaptureState {
             sink: sink.clone(),
             identity: Arc::new(IdentityStore::in_memory().unwrap()),
-            registry: Arc::new(Registry::in_memory().unwrap()),
+            authorizer: Arc::new(LegacyRegistryCaptureAuthorizer::new(registry)),
             limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(Metrics::default()),
         };
@@ -244,6 +368,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_unknown_token_rejects_entire_batch_before_append() {
+        let sink = Arc::new(MemorySink::default());
+        let registry = Arc::new(Registry::in_memory().unwrap());
+        registry
+            .create_project("phc_known", "Known", "2026-08-20T00:00:00Z")
+            .unwrap();
+        let state = CaptureState {
+            sink: sink.clone(),
+            identity: Arc::new(IdentityStore::in_memory().unwrap()),
+            authorizer: Arc::new(LegacyRegistryCaptureAuthorizer::new(registry)),
+            limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
+            metrics: Arc::new(Metrics::default()),
+        };
+        let body = r#"[{"event":"known","distinct_id":"u1","token":"phc_known"},{"event":"unknown","distinct_id":"u2","token":"phc_unknown"}]"#;
+
+        let status = post_body(router(state), "/batch/", body).await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(sink.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_clients_cannot_mark_batches_as_historical_migrations() {
+        let sink = Arc::new(BatchSink::default());
+        let registry = Arc::new(Registry::in_memory().unwrap());
+        let state = CaptureState {
+            sink: sink.clone(),
+            identity: Arc::new(IdentityStore::in_memory().unwrap()),
+            authorizer: Arc::new(LegacyRegistryCaptureAuthorizer::new(registry)),
+            limiter: Arc::new(RateLimiter::new(crate::ratelimit::DEFAULT_MAX_PER_SEC)),
+            metrics: Arc::new(Metrics::default()),
+        };
+        let body = r#"{"api_key":"phc_t","historical_migration":true,"batch":[{"event":"a","distinct_id":"u1"}]}"#;
+
+        let status = post_body(router(state), "/batch/", body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let batches = sink.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert!(!batches[0].historical_migration);
+    }
+
+    #[tokio::test]
     async fn all_aliases_accept() {
         for path in ["/e", "/capture", "/track", "/engage", "/i/v0/e", "/batch"] {
             let (router, _) = app_with_sink();
@@ -260,14 +427,20 @@ mod tests {
     #[tokio::test]
     async fn malformed_json_is_400_never_retried() {
         let (router, _) = app_with_sink();
-        assert_eq!(post_body(router, "/e/", "not json").await, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            post_body(router, "/e/", "not json").await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
     async fn missing_token_is_401() {
         let (router, _) = app_with_sink();
         let body = r#"[{"event":"a","distinct_id":"u1"}]"#;
-        assert_eq!(post_body(router, "/e/", body).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post_body(router, "/e/", body).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

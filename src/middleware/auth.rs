@@ -27,7 +27,8 @@ fn extract_session(headers: &axum::http::HeaderMap) -> Option<String> {
         .and_then(|cookies| {
             cookies.split(';').find_map(|c| {
                 let c = c.trim();
-                c.strip_prefix(&format!("{COOKIE_NAME}=")).map(|v| v.to_string())
+                c.strip_prefix(&format!("{COOKIE_NAME}="))
+                    .map(|v| v.to_string())
             })
         })
 }
@@ -47,7 +48,10 @@ pub async fn require_auth(
 
     // Never gate capture endpoints.
     let capture_prefixes = ["/e", "/batch", "/capture", "/track", "/engage", "/i/v0/e"];
-    if capture_prefixes.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {
+    if capture_prefixes
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")))
+    {
         return next.run(request).await;
     }
 
@@ -127,7 +131,9 @@ mod tests {
 
     fn store_with_user() -> Arc<AuthStore> {
         let store = empty_store();
-        store.setup("a@b.c", "correct horse battery", "Org").expect("setup");
+        store
+            .setup("a@b.c", "correct horse battery", "Org")
+            .expect("setup");
         store
     }
 
@@ -147,14 +153,22 @@ mod tests {
     #[tokio::test]
     async fn api_is_gated_without_a_session() {
         let store = store_with_user();
-        assert_eq!(status(store.clone(), "/api/stats").await, StatusCode::UNAUTHORIZED);
-        assert_eq!(status(store, "/api/auth/me").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(store.clone(), "/api/stats").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(store, "/api/auth/me").await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
     async fn session_cookie_opens_the_api() {
         let store = store_with_user();
-        let (_, sid) = store.login("a@b.c", "correct horse battery").expect("login");
+        let (_, sid) = store
+            .login("a@b.c", "correct horse battery")
+            .expect("login");
         let code = app(store)
             .oneshot(
                 Request::get("/api/stats")
@@ -175,4 +189,3 @@ mod tests {
         assert_eq!(status(store_with_user(), "/e/").await, StatusCode::OK);
     }
 }
-

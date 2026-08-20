@@ -24,11 +24,13 @@ impl FileIndex {
             .entry(date.to_string())
             .or_default()
             .extend(file_names.iter().cloned());
-        self.version.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn bump(&self) {
-        self.version.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn read_version(&self) -> u64 {
@@ -56,25 +58,35 @@ impl FileIndex {
     /// include them — dropping a file whose partition is unknown would silently
     /// drop rows.
     pub fn rebuild_from_dir(&self, events_dir: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(events_dir) else { return };
+        let Ok(entries) = std::fs::read_dir(events_dir) else {
+            return;
+        };
         let mut map: HashMap<String, BTreeMap<String, Vec<String>>> = HashMap::new();
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let path = entry.path();
             if path.is_file() && name.ends_with(".parquet") {
-                map.entry("*".into()).or_default().entry("*".into()).or_default().push(name);
+                map.entry("*".into())
+                    .or_default()
+                    .entry("*".into())
+                    .or_default()
+                    .push(name);
                 continue;
             }
             if !path.is_dir() {
                 continue;
             }
-            let Ok(dates) = std::fs::read_dir(&path) else { continue };
+            let Ok(dates) = std::fs::read_dir(&path) else {
+                continue;
+            };
             for date_entry in dates.flatten() {
                 let date = date_entry.file_name().to_string_lossy().to_string();
                 if !date_entry.path().is_dir() {
                     continue;
                 }
-                let Ok(files) = std::fs::read_dir(date_entry.path()) else { continue };
+                let Ok(files) = std::fs::read_dir(date_entry.path()) else {
+                    continue;
+                };
                 for f in files.flatten() {
                     let fname = f.file_name().to_string_lossy().to_string();
                     if fname.ends_with(".parquet") {
@@ -113,7 +125,10 @@ mod tests {
         let idx = FileIndex::new();
         let before = idx.read_version();
         idx.rebuild_from_dir(dir.path());
-        assert!(idx.read_version() > before, "version must move so caches invalidate");
+        assert!(
+            idx.read_version() > before,
+            "version must move so caches invalidate"
+        );
 
         // Own partition + the unattributable legacy file, never another token's.
         assert_eq!(idx.list_files("phc_x").len(), 3);

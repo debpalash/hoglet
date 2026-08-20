@@ -21,9 +21,15 @@ pub struct DashState {
 pub fn router(store: Arc<DashboardStore>) -> Router {
     Router::new()
         .route("/api/insights", get(list_insights).post(save_insight))
-        .route("/api/insights/{id}", get(get_insight).delete(delete_insight))
+        .route(
+            "/api/insights/{id}",
+            get(get_insight).delete(delete_insight),
+        )
         .route("/api/dashboards", get(list_dashboards).post(save_dashboard))
-        .route("/api/dashboards/{id}", get(get_dashboard).delete(delete_dashboard))
+        .route(
+            "/api/dashboards/{id}",
+            get(get_dashboard).delete(delete_dashboard),
+        )
         .route("/api/dashboards/{id}/tiles", put(update_tiles))
         .route("/api/share", post(create_share))
         .route("/api/share/{id}", delete(delete_share))
@@ -32,7 +38,9 @@ pub fn router(store: Arc<DashboardStore>) -> Router {
 }
 
 #[derive(Deserialize)]
-struct TokenQuery { token: String }
+struct TokenQuery {
+    token: String,
+}
 
 #[derive(Deserialize)]
 struct SaveInsightBody {
@@ -113,7 +121,10 @@ async fn get_dashboard(State(s): State<DashState>, Path(id): Path<String>) -> Re
     }
 }
 
-async fn save_dashboard(State(s): State<DashState>, Json(body): Json<SaveDashboardBody>) -> Response {
+async fn save_dashboard(
+    State(s): State<DashState>,
+    Json(body): Json<SaveDashboardBody>,
+) -> Response {
     let dash = Dashboard {
         id: body.id,
         token: body.token.clone(),
@@ -152,11 +163,15 @@ async fn update_tiles(
 }
 
 async fn create_share(State(s): State<DashState>, Json(body): Json<CreateShareBody>) -> Response {
-    match s.store.create_share(&body.object_type, &body.object_id, "user") {
+    match s
+        .store
+        .create_share(&body.object_type, &body.object_id, "user")
+    {
         Ok(link) => Json(serde_json::json!({
             "id": link.id,
             "url": format!("/shared/{}", link.token),
-        })).into_response(),
+        }))
+        .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -169,12 +184,17 @@ async fn delete_share(State(s): State<DashState>, Path(id): Path<String>) -> Res
 async fn get_shared(State(s): State<DashState>, Path(token): Path<String>) -> Response {
     match s.store.get_shared(&token) {
         Ok(shared) => {
-            let mut html = String::from("<!DOCTYPE html><html><head><title>Hoglet — Shared</title><meta charset=utf-8><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;background:#0f0f12;color:#e0e0e0}h1{color:#f47e3e}.tile{background:#1a1a22;border-radius:8px;padding:16px;margin:12px 0}.tile h3{margin:0 0 8px}.tile .val{font-size:24px;font-weight:700}</style></head><body><h1>Hoglet</h1>");
+            let mut html = String::from(
+                "<!DOCTYPE html><html><head><title>Hoglet — Shared</title><meta charset=utf-8><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:40px auto;padding:0 20px;background:#0f0f12;color:#e0e0e0}h1{color:#f47e3e}.tile{background:#1a1a22;border-radius:8px;padding:16px;margin:12px 0}.tile h3{margin:0 0 8px}.tile .val{font-size:24px;font-weight:700}</style></head><body><h1>Hoglet</h1>",
+            );
             if let Some(dash) = &shared.dashboard {
                 html.push_str(&format!("<h2>{}</h2>", dash.name));
                 for tile in &dash.tiles {
                     if let Some(insight) = &tile.insight {
-                        html.push_str(&format!("<div class=tile><h3>{}</h3><div class=val>—</div></div>", insight.name));
+                        html.push_str(&format!(
+                            "<div class=tile><h3>{}</h3><div class=val>—</div></div>",
+                            insight.name
+                        ));
                     }
                 }
             } else if let Some(insight) = &shared.insight {

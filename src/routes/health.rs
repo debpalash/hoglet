@@ -23,6 +23,10 @@ impl Readiness {
         self.0.store(true, Ordering::SeqCst);
     }
 
+    pub fn mark_not_ready(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
     pub fn is_ready(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
@@ -75,6 +79,11 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE
         );
         r.mark_ready();
-        assert_eq!(status(router(r), "/ready").await, StatusCode::OK);
+        assert_eq!(status(router(r.clone()), "/ready").await, StatusCode::OK);
+        r.mark_not_ready();
+        assert_eq!(
+            status(router(r), "/ready").await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

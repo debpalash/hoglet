@@ -1,441 +1,1360 @@
-import { useEffect, useState, useCallback } from "react";
-import { api } from "./api";
-import type { EventCount, RecentEvent, FunnelStep, TrendPoint, FlagDef, Stats } from "./api";
-import type { SavedInsight, Dashboard } from "./api";
+import {
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
+import {
+  api,
+  isApiError,
+  setSessionExpiredCallback,
+  type Dashboard,
+  type FlagDef,
+  type Query,
+  type QueryResponse,
+  type SavedInsight,
+} from "./api";
+import {
+  ACTIVE_PROJECT_STORAGE_KEY,
+  activeProjectPreference,
+  beginProjectRequest,
+  initialWorkspaceState,
+  isCurrentProjectRequest,
+  projectsIn,
+  readActiveProjectPreference,
+  workspaceReducer,
+  type AbortableProjectRequest,
+  type ApiError as WorkspaceApiError,
+  type Project,
+  type ProjectRequestIdentity,
+  type Workspace,
+  type WorkspaceState,
+} from "./workspace";
 
-type Tab = "overview" | "funnels" | "trends" | "flags" | "insights" | "dashboards";
-const TABS: Tab[] = ["overview", "funnels", "trends", "flags", "insights", "dashboards"];
+type Tab = "trends" | "flags" | "insights" | "dashboards";
+type ReadyWorkspaceState = Extract<WorkspaceState, { status: "ready" }>;
+type ProjectErrorHandler = (error: unknown, request: ProjectRequestIdentity) => void;
 
-type AuthState = "loading" | "setup" | "login" | "ready";
-interface UserInfo { id: string; email: string; name: string }
+const TABS: readonly Tab[] = ["trends", "flags", "insights", "dashboards"];
+
+function storedPreference() {
+  if (typeof window === "undefined") return null;
+  return readActiveProjectPreference((key) => window.localStorage.getItem(key));
+}
+
+function rememberProject(userId: string, projectId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      ACTIVE_PROJECT_STORAGE_KEY,
+      JSON.stringify(activeProjectPreference(userId, projectId)),
+    );
+  } catch {
+    // Project selection still works when storage is disabled.
+  }
+}
+
+function unavailableError(error: unknown): WorkspaceApiError {
+  if (isApiError(error)) {
+    return {
+      code: "unavailable",
+      message: error.message,
+      request_id:
+        error.kind === "network" ? "not-issued" : (error.requestId ?? "not-returned"),
+    };
+  }
+  return {
+    code: "unavailable",
+    message: error instanceof Error ? error.message : "Hoglet is unavailable.",
+    request_id: "not-issued",
+  };
+}
+
+function errorMessage(error: unknown): string {
+  if (isApiError(error)) {
+    const field = error.kind === "http" && error.field ? ` (${error.field})` : "";
+    return `${error.message}${field}`;
+  }
+  return error instanceof Error ? error.message : "The request failed.";
+}
+
+function isHttpStatus(error: unknown, status: number): boolean {
+  return isApiError(error) && error.kind === "http" && error.status === status;
+}
 
 export function App() {
-  const [auth, setAuth] = useState<AuthState>("loading");
-  const [user, setUser] = useState<UserInfo | null>(null);
-  const [token, setToken] = useState("phc_demo");
-  const [tab, setTab] = useState<Tab>("overview");
+  const [state, dispatch] = useReducer(workspaceReducer, initialWorkspaceState);
+  const [tab, setTab] = useState<Tab>("trends");
 
-  const checkAuth = useCallback(async () => {
-    const resp = await api.me();
-    if (resp === null) { setAuth("login"); return; }
-    if (resp.user) { setUser(resp.user); setAuth("ready"); return; }
-    try {
-      const r = await fetch("/api/auth/setup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
-      if (r.status === 404) { setAuth("login"); } else { setAuth("setup"); }
-    } catch { setAuth("login"); }
+  useEffect(
+    () => setSessionExpiredCallback(() => dispatch({ type: "sessionExpired" })),
+    [],
+  );
+
+  useEffect(() => {
+    if (state.status !== "bootstrapping") return;
+
+    const controller = new AbortController();
+    const requestEpoch = state.requestEpoch;
+    const reason = state.reason;
+
+    const finish = (
+      result:
+        | { kind: "setupRequired" }
+        | { kind: "unauthenticated" }
+        | { kind: "workspace"; workspace: Workspace; preference: ReturnType<typeof storedPreference> }
+        | { kind: "unavailable"; error: WorkspaceApiError },
+    ) => dispatch({ type: "bootstrapResult", requestEpoch, result });
+
+    const load = async () => {
+      try {
+        if (reason !== "forbiddenWorkspaceRefresh") {
+          const bootstrap = await api.bootstrap(controller.signal);
+          if (bootstrap.setup_required) {
+            finish({ kind: "setupRequired" });
+            return;
+          }
+        }
+
+        try {
+          const workspace = await api.me(controller.signal);
+          finish({ kind: "workspace", workspace, preference: storedPreference() });
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          if (isHttpStatus(error, 401)) {
+            finish({ kind: "unauthenticated" });
+          } else {
+            finish({ kind: "unavailable", error: unavailableError(error) });
+          }
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          finish({ kind: "unavailable", error: unavailableError(error) });
+        }
+      }
+    };
+
+    void load();
+    return () => controller.abort();
+  }, [state]);
+
+  const acceptWorkspace = useCallback((workspace: Workspace) => {
+    dispatch({
+      type: "authenticatedWorkspace",
+      workspace,
+      preference: storedPreference(),
+    });
   }, []);
 
-  useEffect(() => { checkAuth(); }, [checkAuth]);
+  const logout = useCallback(async () => {
+    try {
+      await api.logout();
+      dispatch({ type: "logout" });
+    } catch (error) {
+      if (isHttpStatus(error, 401)) {
+        dispatch({ type: "logout" });
+      } else {
+        dispatch({ type: "unavailable", error: unavailableError(error) });
+      }
+    }
+  }, []);
 
-  if (auth === "loading") return <div className="empty" style={{ margin: 40 }}>Loading…</div>;
-  if (auth === "setup") return <Setup onDone={(u) => { setUser(u); setAuth("ready"); }} />;
-  if (auth === "login") return <Login onDone={(u) => { setUser(u); setAuth("ready"); }} />;
+  const handleProjectError = useCallback<ProjectErrorHandler>((error, request) => {
+    // request() owns the application-wide 401 callback, which dispatches
+    // sessionExpired once for the current session generation.
+    if (isHttpStatus(error, 401)) return;
+    if (isHttpStatus(error, 403)) {
+      dispatch({ type: "forbiddenWorkspaceRefresh", request });
+      return;
+    }
+    if (isApiError(error) && (error.kind === "network" || error.kind === "decode")) {
+      dispatch({ type: "unavailable", error: unavailableError(error), request });
+    }
+  }, []);
+
+  switch (state.status) {
+    case "bootstrapping":
+      return <StatusScreen title="Loading Hoglet…" />;
+    case "setupRequired":
+      return (
+        <Setup
+          onDone={acceptWorkspace}
+          onConflict={() => dispatch({ type: "retry" })}
+        />
+      );
+    case "unauthenticated":
+      return <Login onDone={acceptWorkspace} />;
+    case "unavailable":
+      return (
+        <StatusScreen
+          title="Hoglet is unavailable"
+          detail={state.error.message}
+          action="Retry"
+          onAction={() => dispatch({ type: "retry" })}
+        />
+      );
+    case "readyNoProject":
+      return (
+        <NoProject
+          workspace={state.workspace}
+          onWorkspace={acceptWorkspace}
+          onLogout={logout}
+        />
+      );
+    case "ready":
+      return (
+        <WorkspaceShell
+          state={state}
+          tab={tab}
+          onTab={setTab}
+          onLogout={logout}
+          onProject={(projectId) => {
+            rememberProject(state.workspace.user.id, projectId);
+            dispatch({ type: "projectSelected", projectId });
+          }}
+          onProjectError={handleProjectError}
+        />
+      );
+  }
+}
+
+interface StatusScreenProps {
+  title: string;
+  detail?: string;
+  action?: string;
+  onAction?: () => void;
+}
+
+function StatusScreen({ title, detail, action, onAction }: StatusScreenProps) {
+  return (
+    <main style={{ maxWidth: 520, paddingTop: 64 }}>
+      <section className="panel">
+        <h1>{title}</h1>
+        {detail ? <p className="empty">{detail}</p> : null}
+        {action && onAction ? <button onClick={onAction}>{action}</button> : null}
+      </section>
+    </main>
+  );
+}
+
+interface SetupProps {
+  onDone: (workspace: Workspace) => void;
+  onConflict: () => void;
+}
+
+function Setup({ onDone, onConflict }: SetupProps) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [organizationName, setOrganizationName] = useState("");
+  const [projectName, setProjectName] = useState("My project");
+  const [existingToken, setExistingToken] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const workspace = await api.setup({
+        email,
+        password,
+        organization_name: organizationName,
+        project_name: projectName || undefined,
+        existing_project_token: existingToken.trim() || undefined,
+      });
+      onDone(workspace);
+    } catch (requestError) {
+      if (isHttpStatus(requestError, 409)) {
+        onConflict();
+        return;
+      }
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AuthPanel title="Welcome to Hoglet" detail="Create the first workspace owner.">
+      <form onSubmit={submit}>
+        {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+        <AuthInput label="Email" value={email} onChange={setEmail} type="email" />
+        <AuthInput label="Password" value={password} onChange={setPassword} type="password" />
+        <AuthInput label="Organization" value={organizationName} onChange={setOrganizationName} />
+        <AuthInput label="Project" value={projectName} onChange={setProjectName} />
+        <AuthInput
+          label="Existing project token (optional)"
+          value={existingToken}
+          onChange={setExistingToken}
+          spellCheck={false}
+        />
+        <button type="submit" disabled={busy || !email || !password || !organizationName}>
+          {busy ? "Creating…" : "Create workspace"}
+        </button>
+      </form>
+    </AuthPanel>
+  );
+}
+
+function Login({ onDone }: { onDone: (workspace: Workspace) => void }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      onDone(await api.login({ email, password }));
+    } catch (requestError) {
+      setError(
+        isHttpStatus(requestError, 401)
+          ? "Invalid email or password."
+          : errorMessage(requestError),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <AuthPanel title="Log in">
+      <form onSubmit={submit}>
+        {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+        <AuthInput label="Email" value={email} onChange={setEmail} type="email" />
+        <AuthInput label="Password" value={password} onChange={setPassword} type="password" />
+        <button type="submit" disabled={busy || !email || !password}>
+          {busy ? "Logging in…" : "Log in"}
+        </button>
+      </form>
+    </AuthPanel>
+  );
+}
+
+function AuthPanel({
+  title,
+  detail,
+  children,
+}: {
+  title: string;
+  detail?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <main style={{ maxWidth: 420, paddingTop: 60 }}>
+      <section className="panel">
+        <h1>{title}</h1>
+        {detail ? <p className="empty">{detail}</p> : null}
+        {children}
+      </section>
+    </main>
+  );
+}
+
+interface AuthInputProps {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  type?: "text" | "email" | "password";
+  spellCheck?: boolean;
+}
+
+function AuthInput({
+  label,
+  value,
+  onChange,
+  type = "text",
+  spellCheck,
+}: AuthInputProps) {
+  return (
+    <label style={{ display: "block", marginBottom: 12 }}>
+      <span className="empty" style={{ display: "block", padding: "0 0 4px" }}>
+        {label}
+      </span>
+      <input
+        style={{ width: "100%" }}
+        type={type}
+        value={value}
+        spellCheck={spellCheck}
+        onChange={(event) => onChange(event.target.value)}
+        required={!label.includes("optional")}
+      />
+    </label>
+  );
+}
+
+function NoProject({
+  workspace,
+  onWorkspace,
+  onLogout,
+}: {
+  workspace: Workspace;
+  onWorkspace: (workspace: Workspace) => void;
+  onLogout: () => void;
+}) {
+  const [name, setName] = useState("My project");
+  const [organizationId, setOrganizationId] = useState(
+    () => workspace.organizations[0]?.id ?? "",
+  );
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const create = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api.createProject(organizationId, name);
+      onWorkspace(await api.me());
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <>
-      <header>
-        <span className="hog">🦔</span>
-        <h1>Hoglet</h1>
-        <span className="tag">PostHog-compatible · one binary</span>
-        <input value={token} spellCheck={false} onChange={(e) => setToken(e.target.value)} />
-        <button className="logout" onClick={async () => { await api.logout(); setAuth("login"); setUser(null); }} title="Log out">
-          {user?.email}
-        </button>
-      </header>
+      <SimpleHeader email={workspace.user.email} onLogout={onLogout} />
+      <main style={{ maxWidth: 560 }}>
+        <section className="panel">
+          <h2>No project yet</h2>
+          <p className="empty">Create a project before querying analytics.</p>
+          {workspace.organizations.length ? (
+            <form className="controls" onSubmit={create}>
+              <select
+                aria-label="Organization"
+                value={organizationId}
+                onChange={(event) => setOrganizationId(event.target.value)}
+              >
+                {workspace.organizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>
+                    {organization.name}
+                  </option>
+                ))}
+              </select>
+              <input value={name} onChange={(event) => setName(event.target.value)} />
+              <button type="submit" disabled={busy || !name.trim()}>
+                {busy ? "Creating…" : "Create project"}
+              </button>
+            </form>
+          ) : (
+            <p className="empty">Ask an administrator to grant organization access.</p>
+          )}
+          {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+        </section>
+      </main>
+    </>
+  );
+}
+
+interface WorkspaceShellProps {
+  state: ReadyWorkspaceState;
+  tab: Tab;
+  onTab: (tab: Tab) => void;
+  onProject: (projectId: string) => void;
+  onLogout: () => void;
+  onProjectError: ProjectErrorHandler;
+}
+
+function WorkspaceShell({
+  state,
+  tab,
+  onTab,
+  onProject,
+  onLogout,
+  onProjectError,
+}: WorkspaceShellProps) {
+  const projects = projectsIn(state.workspace);
+  const activeProject = projects.find((project) => project.id === state.activeProjectId);
+
+  if (!activeProject) {
+    return <StatusScreen title="The selected project is no longer available" />;
+  }
+
+  return (
+    <>
+      <WorkspaceHeader
+        workspace={state.workspace}
+        activeProject={activeProject}
+        projects={projects}
+        onProject={onProject}
+        onLogout={onLogout}
+      />
       <nav>
-        {TABS.map((t) => (
-          <button key={t} className={t === tab ? "active" : ""} onClick={() => setTab(t)}>
-            {t[0].toUpperCase() + t.slice(1)}
+        {TABS.map((item) => (
+          <button
+            key={item}
+            className={item === tab ? "active" : ""}
+            onClick={() => onTab(item)}
+          >
+            {item[0].toUpperCase() + item.slice(1)}
           </button>
         ))}
       </nav>
       <main>
-        {tab === "overview" && <Overview token={token} />}
-        {tab === "funnels" && <Funnels token={token} />}
-        {tab === "trends" && <Trends token={token} />}
-        {tab === "flags" && <Flags token={token} />}
-        {tab === "insights" && <Insights token={token} />}
-        {tab === "dashboards" && <Dashboards token={token} />}
+        {tab === "trends" ? (
+          <Trends state={state} onProjectError={onProjectError} />
+        ) : null}
+        {tab === "flags" ? <Flags state={state} onProjectError={onProjectError} /> : null}
+        {tab === "insights" ? (
+          <Insights state={state} onProjectError={onProjectError} />
+        ) : null}
+        {tab === "dashboards" ? (
+          <Dashboards state={state} onProjectError={onProjectError} />
+        ) : null}
       </main>
       <footer>Hoglet · numbers you can trust</footer>
     </>
   );
 }
 
-function Setup({ onDone }: { onDone: (u: UserInfo) => void }) {
-  const [email, setEmail] = useState(""); const [password, setPassword] = useState(""); const [org, setOrg] = useState(""); const [error, setError] = useState("");
-  const submit = async () => { setError(""); const r = await api.setup(email, password, org); if (!r) { setError("Setup failed."); return; } onDone(r.user); };
-  return (<div style={{ maxWidth:380, margin:"60px auto", padding:20 }}><h1 style={{ textAlign:"center" }}>Welcome to Hoglet</h1><p style={{ textAlign:"center", color:"var(--muted)" }}>First-run setup.</p>{error && <div style={{ color:"#e55", marginBottom:12 }}>{error}</div>}<input style={{ display:"block", width:"100%", marginBottom:8 }} placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} /><input style={{ display:"block", width:"100%", marginBottom:8 }} type="password" placeholder="Password" value={password} onChange={e=>setPassword(e.target.value)} /><input style={{ display:"block", width:"100%", marginBottom:12 }} placeholder="Organization name" value={org} onChange={e=>setOrg(e.target.value)} /><button style={{ width:"100%" }} onClick={submit}>Create account</button></div>);
+function SimpleHeader({ email, onLogout }: { email: string; onLogout: () => void }) {
+  return (
+    <header>
+      <span className="hog">🦔</span>
+      <h1>Hoglet</h1>
+      <span className="tag">PostHog-compatible capture · one binary</span>
+      <button style={{ marginLeft: "auto" }} onClick={onLogout} title="Log out">
+        {email}
+      </button>
+    </header>
+  );
 }
 
-function Login({ onDone }: { onDone: (u: UserInfo) => void }) {
-  const [email, setEmail] = useState(""); const [password, setPassword] = useState(""); const [error, setError] = useState("");
-  const submit = async () => { setError(""); const r = await api.login(email, password); if (!r) { setError("Invalid email or password."); return; } onDone(r.user); };
-  return (<div style={{ maxWidth:380, margin:"60px auto", padding:20 }}><h1 style={{ textAlign:"center" }}>Log in</h1>{error && <div style={{ color:"#e55", marginBottom:12 }}>{error}</div>}<input style={{ display:"block", width:"100%", marginBottom:8 }} placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} /><input style={{ display:"block", width:"100%", marginBottom:12 }} type="password" placeholder="Password" value={password} onChange={e=>setPassword(e.target.value)} /><button style={{ width:"100%" }} onClick={submit}>Log in</button></div>);
+interface WorkspaceHeaderProps {
+  workspace: Workspace;
+  activeProject: Project;
+  projects: Project[];
+  onProject: (projectId: string) => void;
+  onLogout: () => void;
 }
 
-function Overview({ token }: { token: string }) {
-  const [stats, setStats] = useState<Stats | null>(null); const [top, setTop] = useState<EventCount[]>([]); const [live, setLive] = useState<RecentEvent[]>([]);
-  const load = useCallback(async () => { const [s, t, l] = await Promise.all([api.stats(token), api.topEvents(token, 8), api.recent(token, 25)]); if (s) setStats(s); if (t) setTop(t); if (l) setLive(l); }, [token]);
-  useEffect(() => { load(); const id = setInterval(load, 2000); return () => clearInterval(id); }, [load]);
-  const epp = stats && stats.unique_persons > 0 ? (stats.total_events / stats.unique_persons).toFixed(1) : "–";
-  const maxTop = Math.max(1, ...top.map((t) => t.count));
-  return (<><div className="cards"><Card label="Total events" value={stats?.total_events} /><Card label="Unique persons" value={stats?.unique_persons} /><Card label="Last 24h" value={stats?.events_24h} /><Card label="Events / person" value={epp} raw /></div><div className="grid2"><section className="panel"><h2>Top events</h2>{top.length ? top.map((t) => (<div className="row" key={t.event}><span>{t.event}</span><div className="bar-wrap"><div className="bar" style={{ width: `${(t.count / maxTop) * 100}%` }} /></div><span className="n">{t.count.toLocaleString()}</span></div>)) : <div className="empty">No events yet.</div>}</section><section className="panel"><h2>Live stream</h2>{live.length ? live.map((e) => (<div className="ev" key={e.uuid}><span className="name">{e.event}</span><span className="did">{e.distinct_id}</span><span className="ts">{e.timestamp.slice(11, 19)}</span></div>)) : <div className="empty">Waiting for events…</div>}</section></div></>);
+function WorkspaceHeader({
+  workspace,
+  activeProject,
+  projects,
+  onProject,
+  onLogout,
+}: WorkspaceHeaderProps) {
+  const [copyStatus, setCopyStatus] = useState("Copy token");
+
+  const copyToken = async () => {
+    try {
+      await navigator.clipboard.writeText(activeProject.token);
+      setCopyStatus("Copied");
+    } catch {
+      setCopyStatus("Copy failed");
+    }
+  };
+
+  useEffect(() => setCopyStatus("Copy token"), [activeProject.id]);
+
+  return (
+    <header>
+      <span className="hog">🦔</span>
+      <h1>Hoglet</h1>
+      <select
+        aria-label="Active project"
+        value={activeProject.id}
+        onChange={(event) => onProject(event.target.value)}
+        style={{ marginLeft: "auto" }}
+      >
+        {projects.map((project) => (
+          <option key={project.id} value={project.id}>
+            {project.name}
+          </option>
+        ))}
+      </select>
+      <code title="Capture token">{activeProject.token}</code>
+      <button onClick={copyToken}>{copyStatus}</button>
+      <button onClick={onLogout} title="Log out">
+        {workspace.user.email}
+      </button>
+    </header>
+  );
 }
 
-function Card({ label, value, raw }: { label: string; value?: number | string; raw?: boolean }) {
-  const shown = value === undefined ? "–" : raw ? value : Number(value).toLocaleString();
-  return (<div className="card"><div className="label">{label}</div><div className="value">{shown}</div></div>);
+interface ProjectRequestTools {
+  start: () => AbortableProjectRequest | null;
+  isCurrent: (request: AbortableProjectRequest) => boolean;
+  report: (error: unknown, request: AbortableProjectRequest) => void;
 }
 
-function Funnels({ token }: { token: string }) {
-  const [input, setInput] = useState("signup, activate, purchase"); const [steps, setSteps] = useState<FunnelStep[]>([]); const [ran, setRan] = useState(false);
-  const run = async () => { const names = input.split(",").map(s => s.trim()).filter(Boolean); if (!names.length) return; const data = await api.funnel(token, names); setSteps(data ?? []); setRan(true); };
-  const first = steps[0]?.reached ?? 0;
-  return (<section className="panel"><h2>Funnel builder</h2><div className="controls"><input style={{ flex:1, minWidth:280 }} value={input} onChange={e=>setInput(e.target.value)} placeholder="comma-separated event names" /><button onClick={run}>Run funnel</button></div>{steps.length ? steps.map((s,i) => { const p = first ? (s.reached/first)*100 : 0; const prev = i ? steps[i-1].reached : s.reached; const drop = prev ? 100-(s.reached/prev)*100 : 0; return (<div className="funnel-step" key={i}><div className="top"><span>{i+1}. {s.event}</span><span><span className="conv">{p.toFixed(0)}%</span>{i ? <span className="drop"> (−{drop.toFixed(0)}% from prev)</span> : null}</span></div><div className="fbar" style={{ width: `${Math.max(p, 2)}%` }}>{s.reached.toLocaleString()}</div></div>); }) : <div className="empty">{ran ? "No data for those steps." : "Enter steps and run."}</div>}</section>);
+function useProjectRequests(
+  state: ReadyWorkspaceState,
+  onProjectError: ProjectErrorHandler,
+): ProjectRequestTools {
+  const stateRef = useRef<WorkspaceState>(state);
+  const errorHandlerRef = useRef(onProjectError);
+  const activeRequestRef = useRef<AbortableProjectRequest | undefined>(undefined);
+  stateRef.current = state;
+  errorHandlerRef.current = onProjectError;
+
+  useEffect(
+    () => () => {
+      activeRequestRef.current?.abort();
+    },
+    [],
+  );
+
+  const start = useCallback(() => {
+    const request = beginProjectRequest(stateRef.current, activeRequestRef.current);
+    if (request) activeRequestRef.current = request;
+    return request;
+  }, []);
+
+  const isCurrent = useCallback(
+    (request: AbortableProjectRequest) =>
+      !request.signal.aborted && isCurrentProjectRequest(stateRef.current, request.identity),
+    [],
+  );
+
+  const report = useCallback((error: unknown, request: AbortableProjectRequest) => {
+    if (!request.signal.aborted && isCurrentProjectRequest(stateRef.current, request.identity)) {
+      errorHandlerRef.current(error, request.identity);
+    }
+  }, []);
+
+  return { start, isCurrent, report };
 }
 
-function Trends({ token }: { token: string }) {
-  const [event, setEvent] = useState("$pageview"); const [days, setDays] = useState(30); const [data, setData] = useState<TrendPoint[] | null>(null);
-  const plot = async () => setData((await api.trend(token, event, days)) ?? []);
-  const W=900, H=240, pad=30; const max = Math.max(1, ...(data??[]).map(d=>d.count)); const bw = data?.length ? (W-pad*2)/data.length : 0;
-  // A "MM-DD" label needs ~46px to stay readable, so only label every Nth bar —
-  // at 30 and 90 days the axis is otherwise an unreadable smear.
-  const labelEvery = bw ? Math.max(1, Math.ceil(46/bw)) : 1;
-  return (<section className="panel"><h2>Trend</h2><div className="controls"><input value={event} onChange={e=>setEvent(e.target.value)} placeholder="event name" /><select value={days} onChange={e=>setDays(Number(e.target.value))}><option value={7}>7 days</option><option value={30}>30 days</option><option value={90}>90 days</option></select><button onClick={plot}>Plot</button></div>{data?.length ? (<svg viewBox={`0 0 ${W} ${H}`} width="100%"><text x={pad} y={16}>{event} — max {max}/day</text>{data.map((d,i) => { const h=(d.count/max)*(H-pad*2); const x=pad+i*bw; const y=H-pad-h; return (<g key={d.day}><rect x={x+2} y={y} width={bw-4} height={h} fill="var(--accent)" rx={2}><title>{d.day}: {d.count}</title></rect>{i%labelEvery===0 && <text x={x+bw/2} y={H-pad+14} textAnchor="middle">{d.day.slice(5)}</text>}</g>); })}</svg>) : <div className="empty">{data ? `No data for "${event}".` : "Pick an event and plot."}</div>}</section>);
+type TrendMath = "total" | "unique_persons";
+type EventOperator =
+  | "exact"
+  | "iexact"
+  | "not_equal"
+  | "contains"
+  | "not_contains"
+  | "icontains"
+  | "is_set"
+  | "is_not_set";
+
+interface SeriesDraft {
+  id: number;
+  event: string;
+  math: TrendMath;
 }
 
-function Flags({ token }: { token: string }) {
-  const [flags, setFlags] = useState<FlagDef[] | null>(null);
-  useEffect(() => { api.flags(token).then(setFlags); }, [token]);
-  return (<section className="panel"><h2>Feature flags</h2>{flags?.length ? flags.map(f=>(<div className="flag" key={f.key}><span className="key">{f.key}{f.variants.length>0 && <span className="did"> {f.variants.map(v=>`${v.key} ${v.rollout}%`).join(" · ")}</span>}</span><span className={`pill ${f.active?"on":"off"}`}>{f.active?"active":"inactive"}</span><span className="rollout">{f.rollout_percentage}%</span></div>)) : <div className="empty">No flags defined.</div>}</section>);
+interface FilterDraft {
+  id: number;
+  key: string;
+  operator: EventOperator;
+  value: string;
 }
 
-// ── Insight builder ──────────────────────────────
+const EVENT_OPERATORS: readonly EventOperator[] = [
+  "exact",
+  "iexact",
+  "not_equal",
+  "contains",
+  "not_contains",
+  "icontains",
+  "is_set",
+  "is_not_set",
+];
 
-const KINDS = ["Trends", "Funnels", "Retention", "Lifecycle", "Stickiness", "Actors"] as const;
-const MATHS = ["total", "dau", "wau", "mau", "unique_sessions", "first_time"] as const;
-const OPERATORS = ["exact", "not_equal", "icontains", "not_contains", "is_set", "is_not_set", "gt", "lt"] as const;
-const RANGES: [string, number][] = [["7 days", 7], ["30 days", 30], ["90 days", 90]];
+function utcInput(date: Date): string {
+  return date.toISOString().slice(0, 16);
+}
 
-type FilterRow = { key: string; op: string; value: string };
+function initialRange(): { from: string; to: string } {
+  const to = new Date();
+  const from = new Date(to.getTime() - 30 * 24 * 60 * 60 * 1000);
+  return { from: utcInput(from), to: utcInput(to) };
+}
 
-/** Build the IR the backend expects from the builder's current state. */
-function buildQuery(kind: string, events: string[], math: string, days: number,
-                    interval: string, filters: FilterRow[], breakdown: string) {
-  const valued = (op: string) => !["is_set", "is_not_set"].includes(op);
+function absoluteUtc(value: string): string | null {
+  if (!value) return null;
+  const parsed = new Date(`${value}:00Z`);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function buildTrendsQuery(
+  series: SeriesDraft[],
+  filters: FilterDraft[],
+  breakdown: string,
+  interval: "Hour" | "Day" | "Week" | "Month",
+  from: string,
+  to: string,
+): Query {
+  const needsValue = (operator: EventOperator) =>
+    operator !== "is_set" && operator !== "is_not_set";
+
+  // GroupOp's generated TS spelling follows the Rust variant ("And"), while
+  // serde's actual wire spelling is "AND". Keep the cast at this one boundary.
   return {
-    kind,
-    series: events.map(e => ({ event: { type: "name", value: e }, math: { type: math } })),
+    kind: "Trends",
+    series: series.map((item) => ({
+      event: { type: "name", value: item.event.trim() },
+      math: { type: item.math },
+    })),
     filters: {
       op: "AND",
-      // FilterOperator is adjacently tagged with only unit variants, so it is
-      // `{op}` alone — the operand rides on the filter's own `value` field.
-      values: filters.filter(f => f.key).map(f => ({
-        type: "filter",
-        source: "event",
-        key: f.key,
-        operator: { op: f.op },
-        value: valued(f.op) ? f.value : null,
-      })),
+      values: filters
+        .filter((filter) => filter.key.trim())
+        .map((filter) => ({
+          type: "filter",
+          source: "event",
+          key: filter.key.trim(),
+          operator: { op: filter.operator },
+          value: needsValue(filter.operator) ? filter.value : null,
+        })),
     },
-    breakdown: breakdown ? { source: "event", key: breakdown, limit: 10 } : null,
-    range: { from: null, to: null, last_n: { unit: "d", value: days } },
+    breakdown: breakdown.trim()
+      ? { source: "event", key: breakdown.trim(), limit: 10 }
+      : null,
+    breakdown2: null,
+    range: { from, to, last_n: null },
     interval,
     formulas: [],
-    // Funnels and Retention need their config or the compiler rejects them.
-    funnel_config: kind === "Funnels"
-      ? { order_type: "Ordered", conversion_window_seconds: null, exclusions: [], attribution: "AllSteps" }
-      : null,
-    retention_config: kind === "Retention"
-      ? { cohort_event: { type: "name", value: events[0] ?? "" },
-          retention_event: { type: "name", value: events[1] ?? events[0] ?? "" },
-          retention_type: "Recurring", period: "Day", total_periods: 7 }
-      : null,
-    lifecycle_config: kind === "Lifecycle"
-      ? { event: { type: "name", value: events[0] ?? "" }, prior_period: "Day" } : null,
-    stickiness_config: kind === "Stickiness"
-      ? { event: { type: "name", value: events[0] ?? "" }, window_days: days } : null,
-    actors_config: kind === "Actors"
-      ? { series_index: 0, day: "", offset: 0, limit: 100 } : null,
+    funnel_config: null,
+    retention_config: null,
+    lifecycle_config: null,
+    stickiness_config: null,
+    actors_config: null,
     sql_config: null,
-  };
+  } as unknown as Query;
 }
 
-/** The insight builder — an editor for the query IR.
- *
- *  Every control here maps to one IR field, and the IR it produces is exactly
- *  what gets saved: the saved-insight format and the query format are the same
- *  object, so anything buildable is savable and vice versa. */
-function InsightBuilder({ token, onSave }: { token: string; onSave: (ir: any, name: string) => void }) {
-  const [kind, setKind] = useState<string>("Trends");
-  const [events, setEvents] = useState<string[]>(["$pageview"]);
-  const [math, setMath] = useState<string>("total");
-  const [days, setDays] = useState(30);
-  const [interval, setInterval] = useState("Day");
-  const [filters, setFilters] = useState<FilterRow[]>([]);
+function Trends({
+  state,
+  onProjectError,
+}: {
+  state: ReadyWorkspaceState;
+  onProjectError: ProjectErrorHandler;
+}) {
+  const { start, isCurrent, report } = useProjectRequests(state, onProjectError);
+  const range = useRef(initialRange()).current;
+  const nextId = useRef(1);
+  const [series, setSeries] = useState<SeriesDraft[]>([
+    { id: 0, event: "$pageview", math: "total" },
+  ]);
+  const [filters, setFilters] = useState<FilterDraft[]>([]);
   const [breakdown, setBreakdown] = useState("");
-  const [result, setResult] = useState<any>(null);
+  const [interval, setInterval] = useState<"Hour" | "Day" | "Week" | "Month">("Day");
+  const [from, setFrom] = useState(range.from);
+  const [to, setTo] = useState(range.to);
+  const [eventNames, setEventNames] = useState<string[]>([]);
+  const [propertyKeys, setPropertyKeys] = useState<string[]>([]);
+  const [valueHints, setValueHints] = useState<Record<string, string[]>>({});
+  const [result, setResult] = useState<QueryResponse | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [name, setName] = useState("");
-
-  const [eventNames, setEventNames] = useState<string[]>([]);
-  const [propKeys, setPropKeys] = useState<string[]>([]);
-  const [valueHints, setValueHints] = useState<Record<string, string[]>>({});
+  const [insightName, setInsightName] = useState("");
+  const [saved, setSaved] = useState("");
 
   useEffect(() => {
-    api.catalogEvents(token).then(e => setEventNames(e ?? []));
-    api.catalogProperties(token).then(p => setPropKeys((p ?? []).map(k => k.key)));
-  }, [token]);
-
-  // Pull value suggestions lazily, once per property actually used in a filter.
-  useEffect(() => {
-    for (const f of filters) {
-      if (f.key && !(f.key in valueHints)) {
-        setValueHints(v => ({ ...v, [f.key]: [] }));
-        api.catalogValues(token, f.key).then(vs =>
-          setValueHints(v => ({ ...v, [f.key]: (vs ?? []).map(x => x.value) })));
-      }
-    }
-  }, [filters, token, valueHints]);
-
-  const multiEvent = kind === "Funnels" || kind === "Retention";
-  const ir = () => buildQuery(kind, events.filter(Boolean), math, days, interval, filters, breakdown);
-
-  const run = async () => {
-    setBusy(true); setError("");
-    const r = await api.runQuery(token, ir() as any);
+    setResult(null);
+    setError("");
+    setSaved("");
     setBusy(false);
-    if (!r) { setError("Query failed — check the events and filters."); setResult(null); return; }
-    setResult(r);
+    setValueHints({});
+    const request = start();
+    if (!request) return;
+
+    const loadCatalog = async () => {
+      try {
+        const [events, properties] = await Promise.all([
+          api.catalogEvents(request.identity.projectId, 200, request.signal),
+          api.catalogProperties(request.identity.projectId, "event", request.signal),
+        ]);
+        if (!isCurrent(request)) return;
+        setEventNames(events);
+        setPropertyKeys(properties.map((property) => property.key));
+      } catch (requestError) {
+        if (!isCurrent(request)) return;
+        setError(errorMessage(requestError));
+        report(requestError, request);
+      }
+    };
+
+    void loadCatalog();
+  }, [state.activeProjectId, state.requestEpoch, start, isCurrent, report]);
+
+  const loadValueHints = async (key: string) => {
+    const normalized = key.trim();
+    if (!normalized || normalized in valueHints) return;
+    const request = start();
+    if (!request) return;
+    try {
+      const values = await api.catalogValues(
+        request.identity.projectId,
+        normalized,
+        50,
+        request.signal,
+      );
+      if (isCurrent(request)) {
+        setValueHints((current) => ({ ...current, [normalized]: values }));
+      }
+    } catch (requestError) {
+      report(requestError, request);
+    }
   };
 
-  const setEventAt = (i: number, v: string) =>
-    setEvents(es => es.map((e, j) => (j === i ? v : e)));
+  const queryFromDraft = (): Query | null => {
+    const absoluteFrom = absoluteUtc(from);
+    const absoluteTo = absoluteUtc(to);
+    if (!absoluteFrom || !absoluteTo) {
+      setError("From and to must be absolute UTC timestamps.");
+      return null;
+    }
+    if (absoluteFrom >= absoluteTo) {
+      setError("From must be strictly before to.");
+      return null;
+    }
+    const populatedSeries = series.filter((item) => item.event.trim());
+    if (!populatedSeries.length) {
+      setError("Add at least one event series.");
+      return null;
+    }
+    return buildTrendsQuery(
+      populatedSeries,
+      filters,
+      breakdown,
+      interval,
+      absoluteFrom,
+      absoluteTo,
+    );
+  };
 
-  return (<div style={{ marginBottom: 20 }}>
-    <datalist id="event-names">{eventNames.map(e => <option key={e} value={e} />)}</datalist>
-    <datalist id="prop-keys">{propKeys.map(k => <option key={k} value={k} />)}</datalist>
+  const run = async () => {
+    const query = queryFromDraft();
+    if (!query) return;
+    const request = start();
+    if (!request) return;
+    setBusy(true);
+    setError("");
+    setSaved("");
+    try {
+      const response = await api.runQuery(
+        request.identity.projectId,
+        query,
+        false,
+        request.signal,
+      );
+      if (isCurrent(request)) setResult(response);
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setResult(null);
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    } finally {
+      if (isCurrent(request)) setBusy(false);
+    }
+  };
 
-    <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
-      <select value={kind} onChange={e => { setKind(e.target.value); setResult(null); }}>
-        {KINDS.map(k => <option key={k} value={k}>{k}</option>)}
-      </select>
-      {!multiEvent && (
-        <select value={math} onChange={e => setMath(e.target.value)}>
-          {MATHS.map(m => <option key={m} value={m}>{m}</option>)}
+  const save = async () => {
+    const query = queryFromDraft();
+    if (!query || !insightName.trim()) return;
+    const request = start();
+    if (!request) return;
+    setError("");
+    try {
+      await api.saveInsight(
+        request.identity.projectId,
+        { name: insightName.trim(), query_ir: query },
+        request.signal,
+      );
+      if (isCurrent(request)) {
+        setSaved(`Saved “${insightName.trim()}”.`);
+        setInsightName("");
+      }
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    }
+  };
+
+  const updateSeries = (id: number, patch: Partial<SeriesDraft>) =>
+    setSeries((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    );
+  const updateFilter = (id: number, patch: Partial<FilterDraft>) =>
+    setFilters((current) =>
+      current.map((item) => (item.id === id ? { ...item, ...patch } : item)),
+    );
+
+  return (
+    <section className="panel">
+      <h2>Trends</h2>
+      <p className="empty">
+        Supported today: event totals and unique people, event-property filters, and one
+        event-property breakdown.
+      </p>
+      <datalist id="event-catalog">
+        {eventNames.map((event) => (
+          <option key={event} value={event} />
+        ))}
+      </datalist>
+      <datalist id="property-catalog">
+        {propertyKeys.map((key) => (
+          <option key={key} value={key} />
+        ))}
+      </datalist>
+
+      {series.map((item, index) => (
+        <div className="controls" key={item.id}>
+          <span className="empty">Series {index + 1}</span>
+          <input
+            list="event-catalog"
+            value={item.event}
+            placeholder="event name"
+            onChange={(event) => updateSeries(item.id, { event: event.target.value })}
+          />
+          <select
+            aria-label={`Math for series ${index + 1}`}
+            value={item.math}
+            onChange={(event) =>
+              updateSeries(item.id, { math: event.target.value as TrendMath })
+            }
+          >
+            <option value="total">Total events</option>
+            <option value="unique_persons">Unique people</option>
+          </select>
+          {series.length > 1 ? (
+            <button onClick={() => setSeries((items) => items.filter((x) => x.id !== item.id))}>
+              Remove
+            </button>
+          ) : null}
+        </div>
+      ))}
+      <button
+        disabled={series.length >= 10}
+        onClick={() =>
+          setSeries((items) => [
+            ...items,
+            { id: nextId.current++, event: "", math: "total" },
+          ])
+        }
+      >
+        Add series
+      </button>
+
+      <h3>Event filters</h3>
+      {filters.map((filter) => (
+        <div className="controls" key={filter.id}>
+          <input
+            list="property-catalog"
+            value={filter.key}
+            placeholder="property"
+            onBlur={() => void loadValueHints(filter.key)}
+            onChange={(event) => updateFilter(filter.id, { key: event.target.value })}
+          />
+          <select
+            aria-label="Filter operator"
+            value={filter.operator}
+            onChange={(event) =>
+              updateFilter(filter.id, { operator: event.target.value as EventOperator })
+            }
+          >
+            {EVENT_OPERATORS.map((operator) => (
+              <option key={operator} value={operator}>
+                {operator}
+              </option>
+            ))}
+          </select>
+          {filter.operator === "is_set" || filter.operator === "is_not_set" ? null : (
+            <>
+              <datalist id={`values-${filter.id}`}>
+                {(valueHints[filter.key.trim()] ?? []).map((value) => (
+                  <option key={value} value={value} />
+                ))}
+              </datalist>
+              <input
+                list={`values-${filter.id}`}
+                value={filter.value}
+                placeholder="value"
+                onChange={(event) => updateFilter(filter.id, { value: event.target.value })}
+              />
+            </>
+          )}
+          <button
+            onClick={() => setFilters((items) => items.filter((x) => x.id !== filter.id))}
+          >
+            Remove
+          </button>
+        </div>
+      ))}
+      <button
+        disabled={filters.length >= 32}
+        onClick={() =>
+          setFilters((items) => [
+            ...items,
+            { id: nextId.current++, key: "", operator: "exact", value: "" },
+          ])
+        }
+      >
+        Add filter
+      </button>
+
+      <h3>Range and grouping</h3>
+      <div className="controls">
+        <label>
+          <span className="empty">From (UTC)</span>
+          <input type="datetime-local" value={from} onChange={(event) => setFrom(event.target.value)} />
+        </label>
+        <label>
+          <span className="empty">To (UTC)</span>
+          <input type="datetime-local" value={to} onChange={(event) => setTo(event.target.value)} />
+        </label>
+        <select
+          aria-label="Interval"
+          value={interval}
+          onChange={(event) =>
+            setInterval(event.target.value as "Hour" | "Day" | "Week" | "Month")
+          }
+        >
+          <option value="Hour">Hour</option>
+          <option value="Day">Day</option>
+          <option value="Week">Week</option>
+          <option value="Month">Month</option>
         </select>
-      )}
-      <select value={days} onChange={e => setDays(Number(e.target.value))}>
-        {RANGES.map(([l, v]) => <option key={v} value={v}>{l}</option>)}
-      </select>
-      <select value={interval} onChange={e => setInterval(e.target.value)}>
-        {["Hour", "Day", "Week", "Month"].map(i => <option key={i} value={i}>{i}</option>)}
-      </select>
-      <button onClick={run} disabled={busy}>{busy ? "Running…" : "Run"}</button>
-    </div>
+        <input
+          list="property-catalog"
+          value={breakdown}
+          placeholder="breakdown property (optional)"
+          onChange={(event) => setBreakdown(event.target.value)}
+        />
+        <button onClick={run} disabled={busy}>
+          {busy ? "Running…" : "Run trend"}
+        </button>
+      </div>
 
-    <div style={{ marginBottom: 8 }}>
-      {events.map((ev, i) => (
-        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 4, alignItems: "center" }}>
-          <span style={{ color: "var(--dim)", fontSize: 12, width: 48 }}>
-            {multiEvent ? `Step ${i + 1}` : "Event"}
-          </span>
-          <input list="event-names" value={ev} onChange={e => setEventAt(i, e.target.value)}
-                 placeholder="event name" style={{ width: 220 }} />
-          {events.length > 1 && (
-            <button onClick={() => setEvents(es => es.filter((_, j) => j !== i))}>−</button>
+      {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+      {result ? <ResultView result={result} /> : <div className="empty">Build and run a trend.</div>}
+      {result ? (
+        <div className="controls" style={{ marginTop: 12 }}>
+          <input
+            placeholder="Insight name"
+            value={insightName}
+            onChange={(event) => setInsightName(event.target.value)}
+          />
+          <button disabled={!insightName.trim()} onClick={save}>
+            Save insight
+          </button>
+          {saved ? <span className="empty">{saved}</span> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ResultView({ result }: { result: QueryResponse }) {
+  const populated = result.results.filter((series) => series.data.length > 0);
+  if (!populated.length) return <div className="empty">No data for this query.</div>;
+  const maximum = Math.max(
+    1,
+    ...populated.flatMap((series) => series.data.map((point) => point.count)),
+  );
+
+  return (
+    <div style={{ padding: 12, background: "var(--panel2)", borderRadius: 8 }}>
+      {populated.map((series, seriesIndex) => (
+        <div key={`${series.label}-${series.breakdown_value ?? seriesIndex}`}>
+          <strong>{series.label}</strong>
+          {series.breakdown_value ? <span className="did"> · {series.breakdown_value}</span> : null}
+          {series.data.map((point) => (
+            <div className="row" key={point.interval}>
+              <span>{point.interval}</span>
+              <div className="bar-wrap">
+                <div className="bar" style={{ width: `${(point.count / maximum) * 100}%` }} />
+              </div>
+              <span className="n">{point.count.toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      ))}
+      <p className="empty">
+        {result.meta.kind} · {result.meta.elapsed_ms}ms{result.meta.cached ? " · cached" : ""}
+      </p>
+    </div>
+  );
+}
+
+function Flags({
+  state,
+  onProjectError,
+}: {
+  state: ReadyWorkspaceState;
+  onProjectError: ProjectErrorHandler;
+}) {
+  const { start, isCurrent, report } = useProjectRequests(state, onProjectError);
+  const [flags, setFlags] = useState<FlagDef[] | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setFlags(null);
+    setError("");
+    const request = start();
+    if (!request) return;
+    api
+      .listFlags(request.identity.projectId, request.signal)
+      .then((response) => {
+        if (isCurrent(request)) setFlags(response);
+      })
+      .catch((requestError: unknown) => {
+        if (!isCurrent(request)) return;
+        setError(errorMessage(requestError));
+        report(requestError, request);
+      });
+  }, [state.activeProjectId, state.requestEpoch, start, isCurrent, report]);
+
+  return (
+    <section className="panel">
+      <h2>Feature flags</h2>
+      {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+      {flags?.length ? (
+        flags.map((flag) => (
+          <div className="flag" key={flag.key}>
+            <span className="key">
+              {flag.key}
+              {flag.variants.length ? (
+                <span className="did">
+                  {" "}
+                  {flag.variants.map((variant) => `${variant.key} ${variant.rollout}%`).join(" · ")}
+                </span>
+              ) : null}
+            </span>
+            <span className={`pill ${flag.active ? "on" : "off"}`}>
+              {flag.active ? "active" : "inactive"}
+            </span>
+            <span className="rollout">{flag.rollout_percentage}%</span>
+          </div>
+        ))
+      ) : (
+        <div className="empty">{flags ? "No flags defined." : "Loading flags…"}</div>
+      )}
+    </section>
+  );
+}
+
+function Insights({
+  state,
+  onProjectError,
+}: {
+  state: ReadyWorkspaceState;
+  onProjectError: ProjectErrorHandler;
+}) {
+  const { start, isCurrent, report } = useProjectRequests(state, onProjectError);
+  const [insights, setInsights] = useState<SavedInsight[]>([]);
+  const [dashboards, setDashboards] = useState<Dashboard[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    const request = start();
+    if (!request) return;
+    setLoading(true);
+    setError("");
+    try {
+      const [nextInsights, nextDashboards] = await Promise.all([
+        api.listInsights(request.identity.projectId, request.signal),
+        api.listDashboards(request.identity.projectId, request.signal),
+      ]);
+      if (!isCurrent(request)) return;
+      setInsights(nextInsights);
+      setDashboards(nextDashboards);
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    } finally {
+      if (isCurrent(request)) setLoading(false);
+    }
+  }, [start, isCurrent, report]);
+
+  useEffect(() => {
+    setInsights([]);
+    setDashboards([]);
+    void load();
+  }, [state.activeProjectId, state.requestEpoch, load]);
+
+  const remove = async (insightId: string) => {
+    const request = start();
+    if (!request) return;
+    try {
+      await api.deleteInsight(request.identity.projectId, insightId, request.signal);
+      if (isCurrent(request)) void load();
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    }
+  };
+
+  const pin = async (insightId: string, dashboardId: string) => {
+    const dashboard = dashboards.find((item) => item.id === dashboardId);
+    if (!dashboard || dashboard.tiles.some((tile) => tile.insight_id === insightId)) return;
+    const request = start();
+    if (!request) return;
+    const tiles = [
+      ...dashboard.tiles,
+      { insight_id: insightId, x: 0, y: dashboard.tiles.length * 3, w: 4, h: 3 },
+    ];
+    try {
+      await api.updateDashboardTiles(
+        request.identity.projectId,
+        dashboardId,
+        tiles,
+        request.signal,
+      );
+      if (isCurrent(request)) void load();
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    }
+  };
+
+  return (
+    <section className="panel">
+      <h2>Saved insights</h2>
+      <p className="empty">Create truthful Trends insights from the Trends tab.</p>
+      {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+      {loading ? <div className="empty">Loading insights…</div> : null}
+      {insights.map((insight) => (
+        <div className="row" key={insight.id} style={{ flexWrap: "wrap" }}>
+          <strong>{insight.name}</strong>
+          <span className="did">{insight.query_ir.kind}</span>
+          {dashboards.length ? (
+            <select
+              aria-label={`Pin ${insight.name} to dashboard`}
+              defaultValue=""
+              onChange={(event) => {
+                if (event.target.value) void pin(insight.id, event.target.value);
+                event.target.value = "";
+              }}
+            >
+              <option value="">Pin to…</option>
+              {dashboards.map((dashboard) => (
+                <option key={dashboard.id} value={dashboard.id}>
+                  {dashboard.name}
+                </option>
+              ))}
+            </select>
+          ) : null}
+          <button onClick={() => void remove(insight.id)}>Delete</button>
+        </div>
+      ))}
+      {!loading && !insights.length ? <div className="empty">No saved insights.</div> : null}
+    </section>
+  );
+}
+
+function Dashboards({
+  state,
+  onProjectError,
+}: {
+  state: ReadyWorkspaceState;
+  onProjectError: ProjectErrorHandler;
+}) {
+  const { start, isCurrent, report } = useProjectRequests(state, onProjectError);
+  const [dashboards, setDashboards] = useState<Dashboard[]>([]);
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    const request = start();
+    if (!request) return;
+    setLoading(true);
+    try {
+      const response = await api.listDashboards(request.identity.projectId, request.signal);
+      if (isCurrent(request)) setDashboards(response);
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    } finally {
+      if (isCurrent(request)) setLoading(false);
+    }
+  }, [start, isCurrent, report]);
+
+  useEffect(() => {
+    setDashboards([]);
+    setError("");
+    void load();
+  }, [state.activeProjectId, state.requestEpoch, load]);
+
+  const create = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!name.trim()) return;
+    const request = start();
+    if (!request) return;
+    try {
+      await api.saveDashboard(request.identity.projectId, { name: name.trim() }, request.signal);
+      if (isCurrent(request)) {
+        setName("");
+        void load();
+      }
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    }
+  };
+
+  const remove = async (dashboardId: string) => {
+    const request = start();
+    if (!request) return;
+    try {
+      await api.deleteDashboard(request.identity.projectId, dashboardId, request.signal);
+      if (isCurrent(request)) void load();
+    } catch (requestError) {
+      if (!isCurrent(request)) return;
+      setError(errorMessage(requestError));
+      report(requestError, request);
+    }
+  };
+
+  return (
+    <section className="panel">
+      <h2>Dashboards</h2>
+      <form className="controls" onSubmit={create}>
+        <input
+          placeholder="Dashboard name"
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+        />
+        <button type="submit" disabled={!name.trim()}>
+          Create
+        </button>
+      </form>
+      {error ? <p style={{ color: "#e55" }}>{error}</p> : null}
+      {loading ? <div className="empty">Loading dashboards…</div> : null}
+      {dashboards.map((dashboard) => (
+        <div
+          key={dashboard.id}
+          style={{ background: "var(--panel2)", borderRadius: 8, padding: 12, marginBottom: 8 }}
+        >
+          <div style={{ display: "flex", alignItems: "center" }}>
+            <strong>{dashboard.name}</strong>
+            <span className="did" style={{ marginLeft: 8 }}>
+              {dashboard.tiles.length} tiles
+            </span>
+            <button style={{ marginLeft: "auto" }} onClick={() => void remove(dashboard.id)}>
+              Delete
+            </button>
+          </div>
+          {dashboard.tiles.length ? (
+            dashboard.tiles.map((tile) => (
+              <div className="row" key={tile.insight_id}>
+                {tile.insight?.name ?? tile.insight_id}
+              </div>
+            ))
+          ) : (
+            <div className="empty">Pin insights from the Insights tab.</div>
           )}
         </div>
       ))}
-      <button onClick={() => setEvents(es => [...es, ""])} style={{ fontSize: 12 }}>
-        + {multiEvent ? "step" : "series"}
-      </button>
-    </div>
-
-    <div style={{ marginBottom: 8 }}>
-      {filters.map((f, i) => (
-        <div key={i} style={{ display: "flex", gap: 8, marginBottom: 4, alignItems: "center" }}>
-          <span style={{ color: "var(--dim)", fontSize: 12, width: 48 }}>{i === 0 ? "Where" : "and"}</span>
-          <input list="prop-keys" value={f.key} placeholder="property" style={{ width: 160 }}
-                 onChange={e => setFilters(fs => fs.map((x, j) => j === i ? { ...x, key: e.target.value } : x))} />
-          <select value={f.op}
-                  onChange={e => setFilters(fs => fs.map((x, j) => j === i ? { ...x, op: e.target.value } : x))}>
-            {OPERATORS.map(o => <option key={o} value={o}>{o}</option>)}
-          </select>
-          {!["is_set", "is_not_set"].includes(f.op) && (<>
-            <datalist id={`vals-${i}`}>
-              {(valueHints[f.key] ?? []).map(v => <option key={v} value={v} />)}
-            </datalist>
-            <input list={`vals-${i}`} value={f.value} placeholder="value" style={{ width: 160 }}
-                   onChange={e => setFilters(fs => fs.map((x, j) => j === i ? { ...x, value: e.target.value } : x))} />
-          </>)}
-          <button onClick={() => setFilters(fs => fs.filter((_, j) => j !== i))}>−</button>
-        </div>
-      ))}
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <button style={{ fontSize: 12 }}
-                onClick={() => setFilters(fs => [...fs, { key: "", op: "exact", value: "" }])}>
-          + filter
-        </button>
-        <span style={{ color: "var(--dim)", fontSize: 12, marginLeft: 8 }}>Breakdown</span>
-        <input list="prop-keys" value={breakdown} placeholder="none"
-               onChange={e => setBreakdown(e.target.value)} style={{ width: 160 }} />
-      </div>
-    </div>
-
-    {error && <div style={{ color: "#e55", marginBottom: 8 }}>{error}</div>}
-
-    {result && <ResultView result={result} />}
-
-    {result && (
-      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-        <input placeholder="Insight name" value={name} onChange={e => setName(e.target.value)} />
-        <button disabled={!name.trim()} onClick={() => { onSave(ir(), name.trim()); setName(""); }}>
-          Save insight
-        </button>
-      </div>
-    )}
-  </div>);
-}
-
-/** Renders whatever shape came back — a bar chart for one series over time,
- *  a table when there are several or when the x-axis is not time. */
-function ResultView({ result }: { result: any }) {
-  const series: any[] = result.results ?? [];
-  if (!series.length || !series.some(s => (s.data?.length ?? 0) > 0)) {
-    return <div className="empty">No data for this query.</div>;
-  }
-  const single = series.length === 1;
-  const max = Math.max(1, ...series.flatMap(s => (s.data ?? []).map((d: any) => d.count)));
-
-  return (<div style={{ padding: 12, background: "var(--panel2)", borderRadius: 8 }}>
-    {single ? (
-      <div>
-        <div style={{ fontSize: 12, color: "var(--dim)", marginBottom: 6 }}>
-          {series[0].label} — max {max.toLocaleString()}
-        </div>
-        {series[0].data.slice(0, 40).map((d: any) => (
-          <div key={d.interval} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 2 }}>
-            <span style={{ width: 130, fontSize: 12, color: "var(--dim)" }}>{d.interval}</span>
-            <div style={{ flex: 1, background: "var(--line)", borderRadius: 3, height: 12 }}>
-              <div style={{ width: `${(d.count / max) * 100}%`, background: "var(--accent)", height: "100%", borderRadius: 3 }} />
-            </div>
-            <span style={{ width: 60, textAlign: "right", fontSize: 12 }}>{d.count.toLocaleString()}</span>
-          </div>
-        ))}
-      </div>
-    ) : (
-      series.map((s, i) => (
-        <div key={i} style={{ marginBottom: 6 }}>
-          <strong>{s.label}</strong>
-          {s.breakdown_value ? <span className="did"> · {s.breakdown_value}</span> : null}
-          <span style={{ marginLeft: 8 }}>
-            {(s.data ?? []).slice(0, 8).map((d: any) => `${d.interval}: ${d.count.toLocaleString()}`).join("  ")}
-          </span>
-        </div>
-      ))
-    )}
-    <div style={{ fontSize: 11, color: "var(--dim)", marginTop: 6 }}>
-      {result.meta?.kind} · {result.meta?.elapsed_ms}ms{result.meta?.cached ? " · cached" : ""}
-    </div>
-  </div>);
-}
-
-function Insights({ token }: { token: string }) {
-  const [insights, setInsights] = useState<SavedInsight[]>([]);
-  const [dashboards, setDashboards] = useState<Dashboard[]>([]);
-
-  const load = async () => {
-    const [ir, dr] = await Promise.all([
-      fetch(`/api/insights?token=${encodeURIComponent(token)}`),
-      fetch(`/api/dashboards?token=${encodeURIComponent(token)}`),
-    ]);
-    if (ir.ok) setInsights(await ir.json());
-    if (dr.ok) setDashboards(await dr.json());
-  };
-  useEffect(() => { load(); }, [token]);
-
-  const save = async (query_ir: any, name: string) => {
-    const r = await fetch("/api/insights", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token, name, query_ir }),
-    });
-    if (r.ok) load();
-  };
-
-  const pinToDashboard = async (insightId: string, dashboardId: string) => {
-    const dash = dashboards.find(d => d.id === dashboardId);
-    if (!dash) return;
-    const tiles = [...(dash.tiles || []), { insight_id: insightId, x: 0, y: (dash.tiles || []).length * 3, w: 4, h: 3 }];
-    await fetch(`/api/dashboards/${dashboardId}/tiles`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(tiles) });
-    load();
-  };
-
-  return (<section className="panel">
-    <h2>Insights</h2>
-    <InsightBuilder token={token} onSave={save} />
-    <h3>Saved ({insights.length})</h3>
-    {insights.map(i => (
-      <div key={i.id} className="row" style={{ padding: "6px 0", flexWrap: "wrap" }}>
-        <span style={{ fontWeight: 600 }}>{i.name}</span>
-        <span className="did" style={{ marginLeft: 8 }}>{i.query_ir?.kind ?? i.description}</span>
-        {dashboards.length > 0 && (
-          <select
-            style={{ marginLeft: 12, fontSize: 12 }}
-            value=""
-            onChange={async (e) => { if (e.target.value) { await pinToDashboard(i.id, e.target.value); } }}
-          >
-            <option value="">Pin to…</option>
-            {dashboards.map(d => (<option key={d.id} value={d.id}>{d.name}</option>))}
-          </select>
-        )}
-        <button style={{ marginLeft: "auto" }} onClick={async () => { await fetch(`/api/insights/${i.id}`, { method: "DELETE" }); load(); }}>Del</button>
-      </div>
-    ))}
-  </section>);
-}
-
-// ── Dashboards ───────────────────────────────────
-
-function Dashboards({ token }: { token: string }) {
-  const [dashboards, setDashboards] = useState<Dashboard[]>([]);
-  const [name, setName] = useState("");
-
-  const load = async () => {
-    const r = await fetch(`/api/dashboards?token=${encodeURIComponent(token)}`);
-    if (r.ok) setDashboards(await r.json());
-  };
-  useEffect(() => { load(); }, [token]);
-
-  const create = async () => {
-    if (!name.trim()) return;
-    await fetch("/api/dashboards", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token, name }) });
-    setName(""); load();
-  };
-
-  return (<section className="panel">
-    <h2>Dashboards</h2>
-    <div className="controls" style={{ marginBottom: 12 }}>
-      <input placeholder="Dashboard name" value={name} onChange={e => setName(e.target.value)} />
-      <button onClick={create}>Create</button>
-    </div>
-    {dashboards.map(d => (
-      <div key={d.id} style={{ background: "var(--bg-card)", borderRadius: 8, padding: 12, marginBottom: 8 }}>
-        <div style={{ display: "flex", alignItems: "center" }}>
-          <strong>{d.name}</strong>
-          <span className="did" style={{ marginLeft: 8 }}>{d.tiles?.length ?? 0} tiles</span>
-          <button onClick={async () => { await fetch(`/api/dashboards/${d.id}`, { method: "DELETE" }); load(); }} style={{ marginLeft: "auto", color: "#e55" }}>Del</button>
-        </div>
-        {d.tiles?.length ? (<div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 8, marginTop: 8 }}>
-          {d.tiles.map(t => (
-            <div key={t.insight_id} style={{ background: "var(--bg)", borderRadius: 6, padding: 8, border: "1px solid var(--border)" }}>
-              <div style={{ fontSize: 12, color: "var(--muted)" }}>{t.insight?.name ?? t.insight_id.slice(0, 8)}</div>
-            </div>
-          ))}
-        </div>) : <div className="empty" style={{ marginTop: 8 }}>No tiles. Add tiles from the Insights tab.</div>}
-      </div>
-    ))}
-  </section>);
+      {!loading && !dashboards.length ? <div className="empty">No dashboards yet.</div> : null}
+    </section>
+  );
 }

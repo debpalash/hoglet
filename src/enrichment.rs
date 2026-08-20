@@ -57,12 +57,7 @@ impl Enricher {
 
     /// Enrich a single event in-place. `ip` is the connection IP; `user_agent`
     /// is the User-Agent header. Both optional.
-    pub fn enrich(
-        &self,
-        event: &mut CapturedEvent,
-        ip: Option<&str>,
-        user_agent: Option<&str>,
-    ) {
+    pub fn enrich(&self, event: &mut CapturedEvent, ip: Option<&str>, user_agent: Option<&str>) {
         self.enrich_user_agent(event, user_agent);
         self.enrich_device_id(event, ip);
     }
@@ -75,12 +70,7 @@ impl Enricher {
             .properties
             .get("$user_agent")
             .and_then(|v| v.as_str())
-            .or_else(|| {
-                event
-                    .properties
-                    .get("$useragent")
-                    .and_then(|v| v.as_str())
-            });
+            .or_else(|| event.properties.get("$useragent").and_then(|v| v.as_str()));
 
         let header_ua = user_agent;
 
@@ -152,7 +142,6 @@ impl Enricher {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use serde_json::json;
     use uuid::Uuid;
 
     fn event(ip: Option<&str>, ua: Option<&str>) -> CapturedEvent {
@@ -183,7 +172,9 @@ mod tests {
 
         let mut ev = event(
             Some("1.2.3.4"),
-            Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            Some(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            ),
         );
         enricher.enrich(&mut ev, Some("1.2.3.4"), Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
 
@@ -199,10 +190,17 @@ mod tests {
         };
         let enricher = Enricher::new(config);
 
-        let mut ev = event(Some("1.2.3.4"), Some("Mozilla/5.0 Chrome/120 Safari/537.36"));
+        let mut ev = event(
+            Some("1.2.3.4"),
+            Some("Mozilla/5.0 Chrome/120 Safari/537.36"),
+        );
         ev.properties
             .insert("$browser".into(), "MyCustomBrowser".into());
-        enricher.enrich(&mut ev, Some("1.2.3.4"), Some("Mozilla/5.0 Chrome/120 Safari/537.36"));
+        enricher.enrich(
+            &mut ev,
+            Some("1.2.3.4"),
+            Some("Mozilla/5.0 Chrome/120 Safari/537.36"),
+        );
 
         assert_eq!(
             ev.properties.get("$browser").and_then(|v| v.as_str()),

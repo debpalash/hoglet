@@ -58,17 +58,37 @@ pub fn scan_and_truncate(path: &Path) -> std::io::Result<ScannedSegment> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
 
+    let scanned = scan_bytes(bytes);
+
+    if scanned.truncated {
+        // Invalid tail: truncate it away, durably.
+        file.set_len(scanned.valid_len)?;
+        file.sync_all()?;
+    }
+    Ok(scanned)
+}
+
+/// Scan a legacy segment without changing it. Offline migration must be a
+/// read-only observer of legacy storage, including torn tails.
+pub fn scan_read_only(path: &Path) -> std::io::Result<ScannedSegment> {
+    let mut file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(scan_bytes(bytes))
+}
+
+fn scan_bytes(bytes: Vec<u8>) -> ScannedSegment {
     let mut records = Vec::new();
     let mut offset = 0usize;
 
     loop {
         let remaining = bytes.len() - offset;
         if remaining == 0 {
-            return Ok(ScannedSegment {
+            return ScannedSegment {
                 records,
                 valid_len: offset as u64,
                 truncated: false,
-            });
+            };
         }
         if remaining < RECORD_HEADER_BYTES {
             break;
@@ -87,14 +107,11 @@ pub fn scan_and_truncate(path: &Path) -> std::io::Result<ScannedSegment> {
         offset = payload_start + len;
     }
 
-    // Invalid tail: truncate it away, durably.
-    file.set_len(offset as u64)?;
-    file.sync_all()?;
-    Ok(ScannedSegment {
+    ScannedSegment {
         records,
         valid_len: offset as u64,
         truncated: true,
-    })
+    }
 }
 
 /// List segment files in `dir`, ordered by sequence number.

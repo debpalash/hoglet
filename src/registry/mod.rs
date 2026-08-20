@@ -116,7 +116,8 @@ mod tests {
     #[test]
     fn closed_mode_requires_registration() {
         let r = Registry::in_memory().unwrap();
-        r.create_project("phc_known", "Acme", "2026-07-21T00:00:00Z").unwrap();
+        r.create_project("phc_known", "Acme", "2026-07-21T00:00:00Z")
+            .unwrap();
         assert_eq!(r.check("phc_known"), Decision::Accept);
         assert_eq!(r.check("phc_unknown"), Decision::Reject);
     }
@@ -125,7 +126,8 @@ mod tests {
     fn creating_project_flips_to_closed_mode() {
         let r = Registry::in_memory().unwrap();
         assert_eq!(r.check("phc_x"), Decision::Accept); // open
-        r.create_project("phc_y", "Y", "2026-07-21T00:00:00Z").unwrap();
+        r.create_project("phc_y", "Y", "2026-07-21T00:00:00Z")
+            .unwrap();
         assert_eq!(r.check("phc_x"), Decision::Reject); // now closed
         assert_eq!(r.check("phc_y"), Decision::Accept);
     }

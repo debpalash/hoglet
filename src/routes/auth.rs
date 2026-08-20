@@ -7,7 +7,7 @@ use axum::{
     extract::State,
     http::{StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post, delete},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,14 +71,18 @@ struct KeyCreatedResponse {
 fn set_cookie(response: &mut Response, sid: &str) {
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!("{COOKIE_NAME}={sid}; {COOKIE_TTL}").parse().unwrap(),
+        format!("{COOKIE_NAME}={sid}; {COOKIE_TTL}")
+            .parse()
+            .unwrap(),
     );
 }
 
 fn clear_cookie(response: &mut Response) {
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!("{COOKIE_NAME}=; Max-Age=0; Path=/").parse().unwrap(),
+        format!("{COOKIE_NAME}=; Max-Age=0; Path=/")
+            .parse()
+            .unwrap(),
     );
 }
 
@@ -100,14 +104,14 @@ fn extract_session(headers: &axum::http::HeaderMap) -> Option<String> {
 
 // ── Handlers ─────────────────────────────────────────────────
 
-async fn setup(
-    State(state): State<AuthState>,
-    Json(body): Json<SetupBody>,
-) -> Response {
+async fn setup(State(state): State<AuthState>, Json(body): Json<SetupBody>) -> Response {
     if !state.store.is_empty().unwrap_or(true) {
         return (StatusCode::NOT_FOUND, "setup already completed").into_response();
     }
-    match state.store.setup(&body.email, &body.password, &body.org_name) {
+    match state
+        .store
+        .setup(&body.email, &body.password, &body.org_name)
+    {
         Ok((user, _, _)) => {
             let sid = state.store.login(&body.email, &body.password);
             let mut resp = Json(LoginResponse { user, orgs: vec![] }).into_response();
@@ -126,10 +130,7 @@ async fn setup(
     }
 }
 
-async fn login(
-    State(state): State<AuthState>,
-    Json(body): Json<LoginBody>,
-) -> Response {
+async fn login(State(state): State<AuthState>, Json(body): Json<LoginBody>) -> Response {
     match state.store.login(&body.email, &body.password) {
         Ok((user, sid)) => {
             let orgs = state.store.list_orgs(&user.id).unwrap_or_default();
@@ -141,10 +142,7 @@ async fn login(
     }
 }
 
-async fn logout(
-    State(state): State<AuthState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
+async fn logout(State(state): State<AuthState>, headers: axum::http::HeaderMap) -> Response {
     if let Some(sid) = extract_session(&headers) {
         let _ = state.store.logout(&sid);
     }
@@ -153,10 +151,7 @@ async fn logout(
     resp
 }
 
-async fn me(
-    State(state): State<AuthState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
+async fn me(State(state): State<AuthState>, headers: axum::http::HeaderMap) -> Response {
     let user = if let Some(sid) = extract_session(&headers) {
         state.store.validate_session(&sid).ok()
     } else if let Some(key) = headers
@@ -172,16 +167,17 @@ async fn me(
     match user {
         Some(u) => {
             let orgs = state.store.list_orgs(&u.id).unwrap_or_default();
-            Json(crate::auth::MeResponse { user: Some(u), orgs }).into_response()
+            Json(crate::auth::MeResponse {
+                user: Some(u),
+                orgs,
+            })
+            .into_response()
         }
         None => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
     }
 }
 
-async fn list_keys(
-    State(state): State<AuthState>,
-    headers: axum::http::HeaderMap,
-) -> Response {
+async fn list_keys(State(state): State<AuthState>, headers: axum::http::HeaderMap) -> Response {
     let user = match authenticate(&state, &headers) {
         Ok(u) => u,
         Err(r) => return r,

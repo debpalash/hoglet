@@ -16,7 +16,9 @@ use axum::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::flags::FlagStore;
+use crate::capture::CaptureAuthorizer;
+use crate::control_resources::ControlResources;
+use crate::flags::{FlagDef, FlagStore};
 use crate::identity::IdentityStore;
 use crate::token;
 
@@ -28,31 +30,97 @@ pub struct FlagsQuery {
 
 #[derive(Clone)]
 pub struct FlagsState {
-    pub store: Arc<FlagStore>,
+    pub store: Option<Arc<FlagStore>>,
+    pub resources: Option<Arc<ControlResources>>,
     pub identity: Option<Arc<IdentityStore>>,
+    pub authorizer: Option<Arc<dyn CaptureAuthorizer>>,
 }
 
+/// Compatibility constructor for the legacy monolithic application.
+///
+/// New production composition must use [`control_wire_router`] and must not merge
+/// [`legacy_admin_router`].
 pub fn router(store: Arc<FlagStore>, identity: Arc<IdentityStore>) -> Router {
+    unchecked_wire_router(store.clone(), identity).merge(legacy_admin_router(store))
+}
+
+/// Builds only the public PostHog wire endpoints. Every project token is
+/// checked against authoritative control state before any evaluation occurs.
+pub fn wire_router(
+    store: Arc<FlagStore>,
+    identity: Arc<IdentityStore>,
+    authorizer: Arc<dyn CaptureAuthorizer>,
+) -> Router {
+    wire_routes(FlagsState {
+        store: Some(store),
+        resources: None,
+        identity: Some(identity),
+        authorizer: Some(authorizer),
+    })
+}
+
+/// Builds the wire endpoints over authoritative, project-scoped Control State.
+/// This is the production constructor; token authorization supplies the stable
+/// project id used for the flag lookup.
+pub fn control_wire_router(
+    resources: Arc<ControlResources>,
+    identity: Arc<IdentityStore>,
+    authorizer: Arc<dyn CaptureAuthorizer>,
+) -> Router {
+    wire_routes(FlagsState {
+        store: None,
+        resources: Some(resources),
+        identity: Some(identity),
+        authorizer: Some(authorizer),
+    })
+}
+
+fn unchecked_wire_router(store: Arc<FlagStore>, identity: Arc<IdentityStore>) -> Router {
+    wire_routes(FlagsState {
+        store: Some(store),
+        resources: None,
+        identity: Some(identity),
+        authorizer: None,
+    })
+}
+
+fn wire_routes(state: FlagsState) -> Router {
     Router::new()
         .route("/flags", post(flags))
         .route("/flags/", post(flags))
         .route("/decide", post(flags))
         .route("/decide/", post(flags))
+        .with_state(state)
+}
+
+/// Legacy token-addressed operator routes. Kept separate so the production
+/// router cannot accidentally expose them as dashboard APIs.
+pub fn legacy_admin_router(store: Arc<FlagStore>) -> Router {
+    Router::new()
         .route("/api/flags", get(list_flags))
         .route("/flags/definitions", get(local_eval_definitions))
-        .with_state(FlagsState { store, identity: Some(identity) })
-    }
+        .with_state(FlagsState {
+            store: Some(store),
+            resources: None,
+            identity: None,
+            authorizer: None,
+        })
+}
 
 #[derive(serde::Deserialize)]
 struct ListQuery {
     token: String,
 }
 
-async fn list_flags(
-    State(state): State<FlagsState>,
-    Query(q): Query<ListQuery>,
-) -> Response {
-    Json(state.store.list(&q.token)).into_response()
+async fn list_flags(State(state): State<FlagsState>, Query(q): Query<ListQuery>) -> Response {
+    Json(
+        state
+            .store
+            .as_ref()
+            .map(|store| store.list(&q.token))
+            .unwrap_or_default(),
+    )
+    .into_response()
 }
 
 async fn flags(
@@ -66,7 +134,8 @@ async fn flags(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"));
 
-    let Ok(text) = crate::capture::decompress::decode(&body, form_encoded, query.compression.as_deref())
+    let Ok(text) =
+        crate::capture::decompress::decode(&body, form_encoded, query.compression.as_deref())
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -87,6 +156,14 @@ async fn flags(
     if token::validate(raw_token).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let authorized_project = if let Some(authorizer) = &state.authorizer {
+        match authorizer.authorize(raw_token).await {
+            Ok(project) => Some(project),
+            Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+        }
+    } else {
+        None
+    };
 
     let distinct_id = request
         .get("distinct_id")
@@ -101,11 +178,53 @@ async fn flags(
         .cloned()
         .unwrap_or_default();
 
-    let first_seen_key = state.identity.as_ref()
+    let first_seen_key = state
+        .identity
+        .as_ref()
         .and_then(|id| id.first_seen_key_for(raw_token, distinct_id));
-    let evaluated = state.store.evaluate(
-        raw_token, distinct_id, &person_properties, &|_, _| true, first_seen_key.as_deref()
-    );
+    let evaluated = if let Some(resources) = &state.resources {
+        let Some(project_id) = authorized_project.and_then(|project| project.project_id) else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        let resources = resources.clone();
+        let definitions = match tokio::task::spawn_blocking(move || {
+            resources.list_flags(&project_id).map(|flags| {
+                flags
+                    .into_iter()
+                    .map(|flag| FlagDef {
+                        key: flag.key,
+                        active: flag.active,
+                        rollout_percentage: flag.rollout_percentage,
+                        variants: flag.variants,
+                        payload: flag.payload,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        {
+            Ok(Ok(definitions)) => definitions,
+            Ok(Err(_)) | Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        crate::flags::evaluate_definitions(
+            &definitions,
+            first_seen_key.as_deref().unwrap_or(distinct_id),
+        )
+    } else {
+        state
+            .store
+            .as_ref()
+            .map(|store| {
+                store.evaluate(
+                    raw_token,
+                    distinct_id,
+                    &person_properties,
+                    &|_, _| true,
+                    first_seen_key.as_deref(),
+                )
+            })
+            .unwrap_or_default()
+    };
     let request_id = uuid::Uuid::new_v4().to_string();
 
     // A flag's value is its variant string when multivariate, else its bool.
@@ -181,7 +300,11 @@ async fn local_eval_definitions(
     State(state): State<FlagsState>,
     Query(q): Query<ListQuery>,
 ) -> Response {
-    let defs = state.store.list(&q.token);
+    let defs = state
+        .store
+        .as_ref()
+        .map(|store| store.list(&q.token))
+        .unwrap_or_default();
     Json(serde_json::json!({
         "flags": defs.into_iter().map(|d: crate::flags::FlagDef| serde_json::json!({
             "key": d.key,
@@ -194,7 +317,8 @@ async fn local_eval_definitions(
             "rollout_percentage": d.rollout_percentage,
             "payload": d.payload,
         })).collect::<Vec<_>>(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -209,12 +333,19 @@ mod tests {
         let store = Arc::new(FlagStore::in_memory().unwrap());
         store.upsert("phc_t", "new-ui", true, 100.0).unwrap();
         store.upsert("phc_t", "beta", true, 0.0).unwrap();
-        router(store, std::sync::Arc::new(crate::identity::IdentityStore::in_memory().unwrap()))
+        router(
+            store,
+            std::sync::Arc::new(crate::identity::IdentityStore::in_memory().unwrap()),
+        )
     }
 
     async fn post(app: Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
         let res = app
-            .oneshot(Request::post(uri).body(Body::from(body.to_string())).unwrap())
+            .oneshot(
+                Request::post(uri)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = res.status();
@@ -255,7 +386,15 @@ mod tests {
     #[tokio::test]
     async fn empty_store_returns_empty_not_error() {
         let store = Arc::new(FlagStore::in_memory().unwrap());
-        let (status, body) = post(router(store, std::sync::Arc::new(crate::identity::IdentityStore::in_memory().unwrap())), "/flags/?v=2", BODY).await;
+        let (status, body) = post(
+            router(
+                store,
+                std::sync::Arc::new(crate::identity::IdentityStore::in_memory().unwrap()),
+            ),
+            "/flags/?v=2",
+            BODY,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["feature_flags"].as_object().unwrap().is_empty());
     }

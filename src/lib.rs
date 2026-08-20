@@ -1,29 +1,40 @@
 //! Hoglet — PostHog-compatible product analytics. One binary.
 //!
 //! The wire contract lives in `spec/wire-compat.md` at the repo root; every handler
-//! cites the section it implements. PostHog wire semantics at the edge,
-//! byte-for-byte — anything custom stays behind it.
+//! cites the section it implements. The supported PostHog wire subset stays
+//! stable at the edge; Hoglet-specific behavior remains behind it.
 
+pub mod application;
 pub mod auth;
 pub mod cache;
 pub mod capture;
 pub mod catalog;
 pub mod cohort;
+pub mod control;
+pub mod control_resources;
 pub mod dashboard_store;
 pub mod demo;
 pub mod enrichment;
+pub mod event_lake;
 pub mod file_index;
 pub mod flags;
 pub mod flush;
 pub mod identity;
+pub mod legacy_import;
+pub mod legacy_resources;
 pub mod metrics;
 pub mod middleware;
+pub mod migration;
+pub mod pipeline;
+pub mod projection_catalog;
+pub mod projections;
 pub mod query;
 pub mod ratelimit;
 pub mod registry;
 pub mod routes;
 pub mod session;
 pub mod sink;
+pub mod storage_bootstrap;
 pub mod store;
 pub mod token;
 pub mod wal;
@@ -43,6 +54,7 @@ use capture::CaptureState;
 #[allow(clippy::too_many_arguments)]
 pub fn app_with_state(
     state: CaptureState,
+    admin_registry: Arc<registry::Registry>,
     readiness: routes::health::Readiness,
     engine: Arc<query::QueryEngine>,
     flag_store: Arc<flags::FlagStore>,
@@ -55,7 +67,7 @@ pub fn app_with_state(
     index: Option<Arc<file_index::FileIndex>>,
 ) -> Router {
     let admin = routes::admin::AdminState {
-        registry: state.registry.clone(),
+        registry: admin_registry,
         flags: flag_store.clone(),
         identity: state.identity.clone(),
         store: store.clone(),
@@ -82,8 +94,13 @@ pub fn app_with_state(
     if let Some(dash) = dash_store {
         router = router.merge(routes::dashboards::router(dash));
     }
-    let auth_layer_state = middleware::auth::AuthLayerState { store: auth_for_middleware };
-    router = router.layer(axum::middleware::from_fn_with_state(auth_layer_state, middleware::auth::require_auth));
+    let auth_layer_state = middleware::auth::AuthLayerState {
+        store: auth_for_middleware,
+    };
+    router = router.layer(axum::middleware::from_fn_with_state(
+        auth_layer_state,
+        middleware::auth::require_auth,
+    ));
     router.layer(CorsLayer::very_permissive())
 }
 
@@ -92,14 +109,18 @@ pub fn app_with_state(
 pub fn app() -> Router {
     let readiness = routes::health::Readiness::new();
     readiness.mark_ready();
+    let registry = Arc::new(registry::Registry::in_memory().expect("in-memory sqlite"));
     app_with_state(
         CaptureState {
             sink: Arc::new(sink::LogSink),
             identity: Arc::new(identity::IdentityStore::in_memory().expect("in-memory sqlite")),
-            registry: Arc::new(registry::Registry::in_memory().expect("in-memory sqlite")),
+            authorizer: Arc::new(capture::LegacyRegistryCaptureAuthorizer::new(
+                registry.clone(),
+            )),
             limiter: Arc::new(ratelimit::RateLimiter::new(ratelimit::DEFAULT_MAX_PER_SEC)),
             metrics: Arc::new(metrics::Metrics::default()),
         },
+        registry,
         readiness,
         Arc::new(query::QueryEngine::new(std::path::PathBuf::from(
             "/nonexistent-hoglet-events",

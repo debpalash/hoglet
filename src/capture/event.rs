@@ -33,7 +33,7 @@ pub enum CaptureError {
     /// 400 — malformed body, missing event name, missing distinct_id, bad
     /// timestamp.
     Malformed(&'static str),
-    /// 401 — missing, mismatched, or invalid token.
+    /// 401 — missing or invalid token.
     Unauthorized(&'static str),
 }
 
@@ -94,11 +94,6 @@ pub fn parse_body(
     };
 
     let mut events = Vec::with_capacity(raw_events.len());
-    // Uniformity check: without a batch-level token, every event must carry
-    // the same one. The batch token itself must never leak into per-event
-    // resolution as if the event carried it.
-    let mut seen_token: Option<String> = None;
-
     for raw in raw_events {
         let Value::Object(obj) = raw else {
             return Err(CaptureError::Malformed("event must be an object"));
@@ -109,17 +104,7 @@ pub fn parse_body(
             continue;
         }
 
-        let event = resolve_event(obj, batch_token.as_deref(), sent_at, now)?;
-
-        match &seen_token {
-            None => seen_token = Some(event.token.clone()),
-            Some(t) if *t != event.token => {
-                return Err(CaptureError::Unauthorized("mismatched tokens in batch"));
-            }
-            Some(_) => {}
-        }
-
-        events.push(event);
+        events.push(resolve_event(obj, batch_token.as_deref(), sent_at, now)?);
     }
 
     Ok(ParsedBatch {
@@ -316,10 +301,9 @@ mod tests {
 
     #[test]
     fn bare_array_shape() {
-        let batch = parse(
-            r#"[{"event":"click","distinct_id":"u1","properties":{"token":"phc_t"}}]"#,
-        )
-        .unwrap();
+        let batch =
+            parse(r#"[{"event":"click","distinct_id":"u1","properties":{"token":"phc_t"}}]"#)
+                .unwrap();
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].event, "click");
         assert_eq!(batch.events[0].token, "phc_t");
@@ -342,12 +326,13 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_tokens_reject_401() {
-        let err = parse(
+    fn bare_array_preserves_each_events_token_for_authorization() {
+        let batch = parse(
             r#"[{"event":"a","distinct_id":"u","token":"phc_1"},{"event":"b","distinct_id":"u","token":"phc_2"}]"#,
         )
-        .unwrap_err();
-        assert!(matches!(err, CaptureError::Unauthorized(_)));
+        .unwrap();
+        assert_eq!(batch.events[0].token, "phc_1");
+        assert_eq!(batch.events[1].token, "phc_2");
     }
 
     #[test]
@@ -374,10 +359,8 @@ mod tests {
 
     #[test]
     fn performance_events_dropped_but_batch_accepted() {
-        let batch = parse(
-            r#"[{"event":"$performance_event","distinct_id":"u","token":"phc_1"}]"#,
-        )
-        .unwrap();
+        let batch =
+            parse(r#"[{"event":"$performance_event","distinct_id":"u","token":"phc_1"}]"#).unwrap();
         assert!(batch.events.is_empty());
     }
 

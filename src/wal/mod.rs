@@ -285,13 +285,33 @@ pub fn read_segment_events(path: &std::path::Path) -> std::io::Result<Vec<Captur
     decode_records(scanned.records)
 }
 
+/// Read a legacy segment without repairing or truncating it.
+///
+/// A torn or corrupt tail is an error here because an offline migration cannot
+/// prove token coverage if any acknowledged-looking bytes are skipped.
+pub fn read_segment_events_read_only(
+    path: &std::path::Path,
+) -> std::io::Result<Vec<CapturedEvent>> {
+    let scanned = segment::scan_read_only(path)?;
+    if scanned.truncated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "legacy WAL has an invalid tail after byte {}",
+                scanned.valid_len
+            ),
+        ));
+    }
+    decode_records(scanned.records)
+}
+
 /// The WAL as the capture pipeline's sink.
 pub struct WalSink(pub Wal);
 
 #[async_trait::async_trait]
 impl EventSink for WalSink {
-    async fn append(&self, events: Vec<CapturedEvent>) -> Result<(), SinkError> {
-        self.0.append(events).await
+    async fn append(&self, batch: crate::sink::AuthorizedEventBatch) -> Result<(), SinkError> {
+        self.0.append(batch.events).await
     }
 }
 

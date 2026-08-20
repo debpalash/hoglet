@@ -60,10 +60,7 @@ struct ValuesQuery {
     limit: usize,
 }
 
-async fn events(
-    State(s): State<CatalogState>,
-    Query(q): Query<CatalogQuery>,
-) -> Response {
+async fn events(State(s): State<CatalogState>, Query(q): Query<CatalogQuery>) -> Response {
     match tokio::task::spawn_blocking(move || {
         if q.prefix.is_empty() {
             s.catalog.all_event_names(&q.token)
@@ -74,28 +71,18 @@ async fn events(
     .await
     {
         Ok(Ok(names)) => Json(names).into_response(),
-        Ok(Err(_)) | Err(_) => {
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Ok(Err(_)) | Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-async fn properties(
-    State(s): State<CatalogState>,
-    Query(q): Query<PropertiesQuery>,
-) -> Response {
+async fn properties(State(s): State<CatalogState>, Query(q): Query<PropertiesQuery>) -> Response {
     match tokio::task::spawn_blocking(move || s.catalog.property_keys(&q.token, &q.source)).await {
         Ok(Ok(keys)) => Json(keys).into_response(),
-        Ok(Err(_)) | Err(_) => {
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Ok(Err(_)) | Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-async fn values(
-    State(s): State<CatalogState>,
-    Query(q): Query<ValuesQuery>,
-) -> Response {
+async fn values(State(s): State<CatalogState>, Query(q): Query<ValuesQuery>) -> Response {
     match tokio::task::spawn_blocking(move || {
         s.catalog
             .property_values(&q.token, &q.key, &q.prefix, q.limit.min(200))
@@ -103,9 +90,7 @@ async fn values(
     .await
     {
         Ok(Ok(vals)) => Json(vals).into_response(),
-        Ok(Err(_)) | Err(_) => {
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Ok(Err(_)) | Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

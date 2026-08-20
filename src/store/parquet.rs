@@ -123,10 +123,9 @@ pub fn read_file(path: &Path) -> std::io::Result<Vec<CapturedEvent>> {
                 event: names.value(i).to_string(),
                 distinct_id: distinct_ids.value(i).to_string(),
                 token: tokens.value(i).to_string(),
-                timestamp: DateTime::<Utc>::from_timestamp_micros(timestamps.value(i))
-                    .ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad timestamp")
-                    })?,
+                timestamp: DateTime::<Utc>::from_timestamp_micros(timestamps.value(i)).ok_or_else(
+                    || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad timestamp"),
+                )?,
                 properties: match serde_json::from_str(properties.value(i)) {
                     Ok(serde_json::Value::Object(map)) => map,
                     _ => {

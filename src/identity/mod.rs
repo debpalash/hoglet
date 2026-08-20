@@ -139,7 +139,10 @@ impl IdentityStore {
         let Some(person) = person else {
             return Ok(false);
         };
-        tx.execute("DELETE FROM distinct_ids WHERE person_id=?1", params![person])?;
+        tx.execute(
+            "DELETE FROM distinct_ids WHERE person_id=?1",
+            params![person],
+        )?;
         tx.execute("DELETE FROM persons WHERE id=?1", params![person])?;
         tx.commit()?;
         Ok(true)
@@ -305,11 +308,12 @@ fn merge(
         }
     }
 
-    let (winner_props, winner_created, winner_key): (String, String, Option<String>) = tx.query_row(
-        "SELECT properties, created_at, first_seen_key FROM persons WHERE id=?1",
-        params![winner],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
+    let (winner_props, winner_created, winner_key): (String, String, Option<String>) = tx
+        .query_row(
+            "SELECT properties, created_at, first_seen_key FROM persons WHERE id=?1",
+            params![winner],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
     let (loser_props, loser_created, loser_key): (String, String, Option<String>) = tx.query_row(
         "SELECT properties, created_at, first_seen_key FROM persons WHERE id=?1",
         params![loser],
@@ -404,7 +408,9 @@ mod tests {
     #[test]
     fn anonymous_event_creates_person() {
         let store = IdentityStore::in_memory().unwrap();
-        store.process(&event("click", "anon1", Value::Null)).unwrap();
+        store
+            .process(&event("click", "anon1", Value::Null))
+            .unwrap();
         assert!(store.person_of("phc_t", "anon1").is_some());
         assert_eq!(store.person_count("phc_t"), 1);
     }
@@ -412,7 +418,9 @@ mod tests {
     #[test]
     fn identify_stitches_anon_history_once() {
         let store = IdentityStore::in_memory().unwrap();
-        store.process(&event("click", "anon1", Value::Null)).unwrap();
+        store
+            .process(&event("click", "anon1", Value::Null))
+            .unwrap();
         store
             .process(&event(
                 "$identify",

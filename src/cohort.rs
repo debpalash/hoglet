@@ -20,7 +20,10 @@ pub struct CohortDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CohortKind { Static, Behavioral }
+pub enum CohortKind {
+    Static,
+    Behavioral,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -37,7 +40,11 @@ pub enum CohortDefinition {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum CohortOp { Gte, Lte, Eq }
+pub enum CohortOp {
+    Gte,
+    Lte,
+    Eq,
+}
 
 #[derive(Debug)]
 pub enum CohortError {
@@ -47,11 +54,15 @@ pub enum CohortError {
 }
 
 impl From<rusqlite::Error> for CohortError {
-    fn from(e: rusqlite::Error) -> Self { CohortError::Db(e) }
+    fn from(e: rusqlite::Error) -> Self {
+        CohortError::Db(e)
+    }
 }
 
 impl From<duckdb::Error> for CohortError {
-    fn from(e: duckdb::Error) -> Self { CohortError::DuckDb(e) }
+    fn from(e: duckdb::Error) -> Self {
+        CohortError::DuckDb(e)
+    }
 }
 
 // ── CohortStore ───────────────────────────────────────────────────
@@ -65,16 +76,26 @@ impl CohortStore {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(CohortStore { conn: Mutex::new(conn) })
+        Ok(CohortStore {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, CohortError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(CohortStore { conn: Mutex::new(conn) })
+        Ok(CohortStore {
+            conn: Mutex::new(conn),
+        })
     }
 
-    pub fn create(&self, token: &str, name: &str, kind: CohortKind, definition: CohortDefinition) -> Result<CohortDef, CohortError> {
+    pub fn create(
+        &self,
+        token: &str,
+        name: &str,
+        kind: CohortKind,
+        definition: CohortDefinition,
+    ) -> Result<CohortDef, CohortError> {
         let conn = self.conn.lock().unwrap();
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp();
@@ -83,34 +104,57 @@ impl CohortStore {
             "INSERT INTO cohorts (id, token, name, kind, definition, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             rusqlite::params![id, token, name, kind_str(&kind), def_json, now, now],
         )?;
-        Ok(CohortDef { id, token: token.into(), name: name.into(), kind, definition })
+        Ok(CohortDef {
+            id,
+            token: token.into(),
+            name: name.into(),
+            kind,
+            definition,
+        })
     }
 
     pub fn list(&self, token: &str) -> Result<Vec<CohortDef>, CohortError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT id, token, name, kind, definition FROM cohorts WHERE token = ?1 ORDER BY name")?;
-        let rows: Vec<CohortDef> = stmt.query_map([token], |r| {
-            let def_str: String = r.get(4)?;
-            Ok(CohortDef {
-                id: r.get(0)?, token: r.get(1)?, name: r.get(2)?,
-                kind: parse_kind(&r.get::<_, String>(3)?),
-                definition: serde_json::from_str(&def_str).unwrap_or(CohortDefinition::Static { distinct_ids: vec![] }),
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, token, name, kind, definition FROM cohorts WHERE token = ?1 ORDER BY name",
+        )?;
+        let rows: Vec<CohortDef> = stmt
+            .query_map([token], |r| {
+                let def_str: String = r.get(4)?;
+                Ok(CohortDef {
+                    id: r.get(0)?,
+                    token: r.get(1)?,
+                    name: r.get(2)?,
+                    kind: parse_kind(&r.get::<_, String>(3)?),
+                    definition: serde_json::from_str(&def_str).unwrap_or(
+                        CohortDefinition::Static {
+                            distinct_ids: vec![],
+                        },
+                    ),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
     pub fn get(&self, id: &str) -> Result<CohortDef, CohortError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT id, token, name, kind, definition FROM cohorts WHERE id = ?1")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, token, name, kind, definition FROM cohorts WHERE id = ?1",
+        )?;
         stmt.query_row([id], |r| {
             let def_str: String = r.get(4)?;
             Ok(CohortDef {
-                id: r.get(0)?, token: r.get(1)?, name: r.get(2)?,
+                id: r.get(0)?,
+                token: r.get(1)?,
+                name: r.get(2)?,
                 kind: parse_kind(&r.get::<_, String>(3)?),
-                definition: serde_json::from_str(&def_str).unwrap_or(CohortDefinition::Static { distinct_ids: vec![] }),
+                definition: serde_json::from_str(&def_str).unwrap_or(CohortDefinition::Static {
+                    distinct_ids: vec![],
+                }),
             })
-        }).map_err(|_| CohortError::NotFound)
+        })
+        .map_err(|_| CohortError::NotFound)
     }
 
     pub fn delete(&self, id: &str) -> Result<(), CohortError> {
@@ -134,9 +178,15 @@ impl CohortStore {
         Ok(())
     }
 
-    pub fn remove_members(&self, cohort_id: &str, distinct_ids: &[String]) -> Result<(), CohortError> {
+    pub fn remove_members(
+        &self,
+        cohort_id: &str,
+        distinct_ids: &[String],
+    ) -> Result<(), CohortError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("DELETE FROM cohort_members WHERE cohort_id = ?1 AND distinct_id = ?2")?;
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM cohort_members WHERE cohort_id = ?1 AND distinct_id = ?2",
+        )?;
         for did in distinct_ids {
             stmt.execute(rusqlite::params![cohort_id, did])?;
         }
@@ -155,8 +205,12 @@ impl CohortStore {
 
     pub fn get_members(&self, cohort_id: &str) -> Result<Vec<String>, CohortError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT distinct_id FROM cohort_members WHERE cohort_id = ?1 ORDER BY added_at")?;
-        let rows: Vec<String> = stmt.query_map([cohort_id], |r| r.get(0))?.collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT distinct_id FROM cohort_members WHERE cohort_id = ?1 ORDER BY added_at",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map([cohort_id], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -164,23 +218,40 @@ impl CohortStore {
     pub fn set_members(&self, cohort_id: &str, distinct_ids: &[String]) -> Result<(), CohortError> {
         let conn = self.conn.lock().unwrap();
         let tx = conn.unchecked_transaction()?;
-        conn.execute("DELETE FROM cohort_members WHERE cohort_id = ?1", [cohort_id])?;
+        conn.execute(
+            "DELETE FROM cohort_members WHERE cohort_id = ?1",
+            [cohort_id],
+        )?;
         let now = Utc::now().timestamp();
-        let mut stmt = conn.prepare_cached("INSERT INTO cohort_members (cohort_id, distinct_id, added_at) VALUES (?1, ?2, ?3)")?;
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO cohort_members (cohort_id, distinct_id, added_at) VALUES (?1, ?2, ?3)",
+        )?;
         for did in distinct_ids {
             stmt.execute(rusqlite::params![cohort_id, did, now])?;
         }
-        conn.execute("UPDATE cohorts SET updated_at = ?1 WHERE id = ?2", rusqlite::params![now, cohort_id])?;
+        conn.execute(
+            "UPDATE cohorts SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, cohort_id],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
     /// Reevaluate all behavioral cohorts for a token. Runs DuckDB queries
     /// against the events Parquet store.
-    pub fn reevaluate_behavioral(&self, token: &str, parquet_glob: &str) -> Result<usize, CohortError> {
+    pub fn reevaluate_behavioral(
+        &self,
+        token: &str,
+        parquet_glob: &str,
+    ) -> Result<usize, CohortError> {
         let cohorts = self.list(token)?;
-        let behavioral: Vec<&CohortDef> = cohorts.iter().filter(|c| matches!(c.kind, CohortKind::Behavioral)).collect();
-        if behavioral.is_empty() { return Ok(0); }
+        let behavioral: Vec<&CohortDef> = cohorts
+            .iter()
+            .filter(|c| matches!(c.kind, CohortKind::Behavioral))
+            .collect();
+        if behavioral.is_empty() {
+            return Ok(0);
+        }
 
         let escaped_glob = parquet_glob.replace('\'', "''");
         let conn = duckdb::Connection::open_in_memory()?;
@@ -189,7 +260,12 @@ impl CohortStore {
         let mut reevaluated = 0;
         for cohort in &behavioral {
             let def = match &cohort.definition {
-                CohortDefinition::Behavioral { event, operator, count, window_days } => (event, operator, count, window_days),
+                CohortDefinition::Behavioral {
+                    event,
+                    operator,
+                    count,
+                    window_days,
+                } => (event, operator, count, window_days),
                 _ => continue,
             };
 
@@ -207,10 +283,17 @@ impl CohortStore {
                  HAVING count(*) {op_sql} ?4",
             );
             let mut stmt = conn.prepare(&sql)?;
-            let members: Vec<String> = stmt.query_map(
-                &[&token as &dyn duckdb::ToSql, &def.0 as &dyn duckdb::ToSql, &(*def.3 as i64) as &dyn duckdb::ToSql, &(*def.2) as &dyn duckdb::ToSql],
-                |r| r.get(0),
-            )?.collect::<Result<Vec<_>, _>>()?;
+            let members: Vec<String> = stmt
+                .query_map(
+                    &[
+                        &token as &dyn duckdb::ToSql,
+                        &def.0 as &dyn duckdb::ToSql,
+                        &(*def.3 as i64) as &dyn duckdb::ToSql,
+                        &(*def.2) as &dyn duckdb::ToSql,
+                    ],
+                    |r| r.get(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
 
             if !members.is_empty() {
                 self.set_members(&cohort.id, &members)?;
@@ -243,11 +326,17 @@ const SCHEMA: &str = "
 ";
 
 fn kind_str(kind: &CohortKind) -> &'static str {
-    match kind { CohortKind::Static => "static", CohortKind::Behavioral => "behavioral" }
+    match kind {
+        CohortKind::Static => "static",
+        CohortKind::Behavioral => "behavioral",
+    }
 }
 
 fn parse_kind(s: &str) -> CohortKind {
-    match s { "behavioral" => CohortKind::Behavioral, _ => CohortKind::Static }
+    match s {
+        "behavioral" => CohortKind::Behavioral,
+        _ => CohortKind::Static,
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -259,8 +348,19 @@ mod tests {
     #[test]
     fn static_cohort_membership() {
         let store = CohortStore::open_in_memory().unwrap();
-        let c = store.create("phc_t", "beta", CohortKind::Static, CohortDefinition::Static { distinct_ids: vec!["u1".into(), "u2".into()] }).unwrap();
-        store.add_members(&c.id, &["u1".into(), "u2".into()]).unwrap();
+        let c = store
+            .create(
+                "phc_t",
+                "beta",
+                CohortKind::Static,
+                CohortDefinition::Static {
+                    distinct_ids: vec!["u1".into(), "u2".into()],
+                },
+            )
+            .unwrap();
+        store
+            .add_members(&c.id, &["u1".into(), "u2".into()])
+            .unwrap();
         assert!(store.is_member(&c.id, "u1").unwrap());
         assert!(!store.is_member(&c.id, "u3").unwrap());
         store.remove_members(&c.id, &["u1".into()]).unwrap();
@@ -270,8 +370,26 @@ mod tests {
     #[test]
     fn list_and_delete() {
         let store = CohortStore::open_in_memory().unwrap();
-        store.create("phc_t", "a", CohortKind::Static, CohortDefinition::Static { distinct_ids: vec![] }).unwrap();
-        store.create("phc_t", "b", CohortKind::Static, CohortDefinition::Static { distinct_ids: vec![] }).unwrap();
+        store
+            .create(
+                "phc_t",
+                "a",
+                CohortKind::Static,
+                CohortDefinition::Static {
+                    distinct_ids: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .create(
+                "phc_t",
+                "b",
+                CohortKind::Static,
+                CohortDefinition::Static {
+                    distinct_ids: vec![],
+                },
+            )
+            .unwrap();
         assert_eq!(store.list("phc_t").unwrap().len(), 2);
         let c = store.list("phc_t").unwrap();
         store.delete(&c[0].id).unwrap();
@@ -281,8 +399,22 @@ mod tests {
     #[test]
     fn behavioral_members_set_and_get() {
         let store = CohortStore::open_in_memory().unwrap();
-        let c = store.create("phc_t", "active", CohortKind::Behavioral, CohortDefinition::Behavioral { event: "pageview".into(), operator: CohortOp::Gte, count: 3, window_days: 7 }).unwrap();
-        store.set_members(&c.id, &["u1".into(), "u2".into(), "u3".into()]).unwrap();
+        let c = store
+            .create(
+                "phc_t",
+                "active",
+                CohortKind::Behavioral,
+                CohortDefinition::Behavioral {
+                    event: "pageview".into(),
+                    operator: CohortOp::Gte,
+                    count: 3,
+                    window_days: 7,
+                },
+            )
+            .unwrap();
+        store
+            .set_members(&c.id, &["u1".into(), "u2".into(), "u3".into()])
+            .unwrap();
         assert_eq!(store.get_members(&c.id).unwrap().len(), 3);
         assert!(store.is_member(&c.id, "u1").unwrap());
     }

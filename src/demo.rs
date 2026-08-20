@@ -21,7 +21,9 @@ pub fn seed_if_demo(
     session: Option<&Arc<crate::session::SessionStore>>,
 ) {
     let demo = std::env::var("HOGLET_DEMO").unwrap_or_default();
-    if demo != "1" { return; }
+    if demo != "1" {
+        return;
+    }
 
     // Skip if data already exists
     if let Ok(files) = store.list_files() {
@@ -47,22 +49,39 @@ pub fn seed_if_demo(
 
     for day in 0..days {
         // More events per recent day for a livelier dashboard
-        let per_day = if day < 2 { events_per_day * 3 } else { events_per_day };
+        let per_day = if day < 2 {
+            events_per_day * 3
+        } else {
+            events_per_day
+        };
         for _ in 0..per_day {
             let person = &persons[rng.gen_range(0..persons.len())];
             let event_type = event_types[rng.gen_range(0..event_types.len())];
             let hours_ago = (days - day) * 24 + rng.gen_range(0..24);
             let minutes_ago = rng.gen_range(0..60);
-            let ts = now - Duration::hours(hours_ago as i64) - Duration::minutes(minutes_ago as i64);
+            let ts =
+                now - Duration::hours(hours_ago as i64) - Duration::minutes(minutes_ago as i64);
 
             let mut props = Map::new();
-            props.insert("$browser".into(), browsers[rng.gen_range(0..browsers.len())].into());
-            props.insert("$geoip_country_code".into(), countries[rng.gen_range(0..countries.len())].into());
+            props.insert(
+                "$browser".into(),
+                browsers[rng.gen_range(0..browsers.len())].into(),
+            );
+            props.insert(
+                "$geoip_country_code".into(),
+                countries[rng.gen_range(0..countries.len())].into(),
+            );
             if event_type == "$pageview" {
-                props.insert("$current_url".into(), format!("https://demo.hoglet.dev/page/{}", rng.gen_range(1..20)).into());
+                props.insert(
+                    "$current_url".into(),
+                    format!("https://demo.hoglet.dev/page/{}", rng.gen_range(1..20)).into(),
+                );
             }
             if event_type == "$click" {
-                props.insert("$click_target".into(), format!("btn_{}", rng.gen_range(1..10)).into());
+                props.insert(
+                    "$click_target".into(),
+                    format!("btn_{}", rng.gen_range(1..10)).into(),
+                );
             }
 
             all_events.push(CapturedEvent {
@@ -92,8 +111,20 @@ pub fn seed_if_demo(
 
     // Create feature flags
     let _ = flags.upsert_full(
-        token, "new-dashboard", true, 50.0,
-        &[Variant { key: "control".into(), rollout: 50.0 }, Variant { key: "treatment".into(), rollout: 50.0 }],
+        token,
+        "new-dashboard",
+        true,
+        50.0,
+        &[
+            Variant {
+                key: "control".into(),
+                rollout: 50.0,
+            },
+            Variant {
+                key: "treatment".into(),
+                rollout: 50.0,
+            },
+        ],
         None,
     );
     let _ = flags.upsert(token, "dark-mode", true, 100.0);
@@ -109,11 +140,21 @@ pub fn seed_if_demo(
             "interval": "Day",
             "formulas": []
         });
-        let i1 = dash.save_insight(token, &crate::dashboard_store::SavedInsight {
-            id: String::new(), token: token.into(), name: "Pageviews".into(),
-            description: "Daily pageview count".into(),
-            query_ir: trends_ir, created_by: "demo".into(), created_at: 0, updated_at: 0,
-        }).ok();
+        let i1 = dash
+            .save_insight(
+                token,
+                &crate::dashboard_store::SavedInsight {
+                    id: String::new(),
+                    token: token.into(),
+                    name: "Pageviews".into(),
+                    description: "Daily pageview count".into(),
+                    query_ir: trends_ir,
+                    created_by: "demo".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .ok();
 
         let funnel_ir = serde_json::json!({
             "kind": "Funnels",
@@ -128,26 +169,59 @@ pub fn seed_if_demo(
             "funnel_config": {"order_type": "Ordered", "conversion_window_seconds": null, "exclusions": [], "attribution": "AllSteps"},
             "formulas": []
         });
-        let i2 = dash.save_insight(token, &crate::dashboard_store::SavedInsight {
-            id: String::new(), token: token.into(), name: "Conversion funnel".into(),
-            description: "Pageview → Click → Identify".into(),
-            query_ir: funnel_ir, created_by: "demo".into(), created_at: 0, updated_at: 0,
-        }).ok();
+        let i2 = dash
+            .save_insight(
+                token,
+                &crate::dashboard_store::SavedInsight {
+                    id: String::new(),
+                    token: token.into(),
+                    name: "Conversion funnel".into(),
+                    description: "Pageview → Click → Identify".into(),
+                    query_ir: funnel_ir,
+                    created_by: "demo".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .ok();
 
         if let (Some(i1), Some(i2)) = (i1, i2) {
-            let _ = dash.save_dashboard(token, &crate::dashboard_store::Dashboard {
-                id: String::new(), token: token.into(), name: "Demo dashboard".into(),
-                tiles: vec![
-                    crate::dashboard_store::DashboardTile { insight_id: i1.id, x: 0, y: 0, w: 6, h: 3, insight: None },
-                    crate::dashboard_store::DashboardTile { insight_id: i2.id, x: 0, y: 3, w: 6, h: 3, insight: None },
-                ],
-                created_by: "demo".into(), created_at: 0,
-            }).ok();
+            let _ = dash
+                .save_dashboard(
+                    token,
+                    &crate::dashboard_store::Dashboard {
+                        id: String::new(),
+                        token: token.into(),
+                        name: "Demo dashboard".into(),
+                        tiles: vec![
+                            crate::dashboard_store::DashboardTile {
+                                insight_id: i1.id,
+                                x: 0,
+                                y: 0,
+                                w: 6,
+                                h: 3,
+                                insight: None,
+                            },
+                            crate::dashboard_store::DashboardTile {
+                                insight_id: i2.id,
+                                x: 0,
+                                y: 3,
+                                w: 6,
+                                h: 3,
+                                insight: None,
+                            },
+                        ],
+                        created_by: "demo".into(),
+                        created_at: 0,
+                    },
+                )
+                .ok();
         }
     }
 
     tracing::info!(
         "demo mode: seeded {} events, {} persons, 3 flags, 2 insights, 1 dashboard",
-        all_events.len(), persons.len()
+        all_events.len(),
+        persons.len()
     );
 }

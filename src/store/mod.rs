@@ -83,7 +83,9 @@ impl EventStore {
             let part_dir = self.dir.join(&token).join(&date);
             std::fs::create_dir_all(&part_dir)?;
 
-            let n = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Name by first event time + uuid: sortable, collision-free.
             let name = format!(
                 "{}-{:06}-{}.parquet",
@@ -429,10 +431,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = EventStore::open(dir.path().to_path_buf()).unwrap();
         for token in ["../../etc", "..", "a/b", "", "with space"] {
-            let paths = store.write_events(&[event_at("x", token, 2026, 7, 21)]).unwrap();
+            let paths = store
+                .write_events(&[event_at("x", token, 2026, 7, 21)])
+                .unwrap();
             for path in paths {
                 assert!(
-                    path.canonicalize().unwrap().starts_with(dir.path().canonicalize().unwrap()),
+                    path.canonicalize()
+                        .unwrap()
+                        .starts_with(dir.path().canonicalize().unwrap()),
                     "{token:?} escaped the store: {path:?}"
                 );
             }
@@ -447,24 +453,36 @@ mod tests {
     fn files_for_prunes_by_token_and_date() {
         let dir = tempfile::tempdir().unwrap();
         let store = EventStore::open(dir.path().to_path_buf()).unwrap();
-        store.write_events(&[
-            event_at("a", "phc_x", 2026, 7, 20),
-            event_at("b", "phc_x", 2026, 7, 21),
-            event_at("c", "phc_x", 2026, 7, 22),
-            event_at("d", "phc_y", 2026, 7, 21),
-        ]).unwrap();
+        store
+            .write_events(&[
+                event_at("a", "phc_x", 2026, 7, 20),
+                event_at("b", "phc_x", 2026, 7, 21),
+                event_at("c", "phc_x", 2026, 7, 22),
+                event_at("d", "phc_y", 2026, 7, 21),
+            ])
+            .unwrap();
 
         let d = |y, m, day| chrono::NaiveDate::from_ymd_opt(y, m, day).unwrap();
 
-        assert_eq!(store.files_for("phc_x", None, None).unwrap().len(), 3, "other project leaked in");
+        assert_eq!(
+            store.files_for("phc_x", None, None).unwrap().len(),
+            3,
+            "other project leaked in"
+        );
         assert_eq!(store.files_for("phc_y", None, None).unwrap().len(), 1);
         assert_eq!(
-            store.files_for("phc_x", Some(d(2026, 7, 21)), Some(d(2026, 7, 21))).unwrap().len(),
+            store
+                .files_for("phc_x", Some(d(2026, 7, 21)), Some(d(2026, 7, 21)))
+                .unwrap()
+                .len(),
             1,
             "date window not pruned"
         );
         assert_eq!(
-            store.files_for("phc_x", Some(d(2026, 7, 21)), None).unwrap().len(),
+            store
+                .files_for("phc_x", Some(d(2026, 7, 21)), None)
+                .unwrap()
+                .len(),
             2,
             "open-ended window wrong"
         );
@@ -483,16 +501,30 @@ mod tests {
         let legacy = dir.path().join("20260721T120000-000000-legacy.parquet");
         parquet::write_file(&[event_at("old", "phc_x", 2026, 7, 21)], &legacy).unwrap();
 
-        store.write_events(&[event_at("new", "phc_x", 2026, 7, 22)]).unwrap();
+        store
+            .write_events(&[event_at("new", "phc_x", 2026, 7, 22)])
+            .unwrap();
 
-        assert_eq!(store.list_files().unwrap().len(), 2, "legacy file not listed");
+        assert_eq!(
+            store.list_files().unwrap().len(),
+            2,
+            "legacy file not listed"
+        );
         assert!(
-            store.files_for("phc_x", None, None).unwrap().contains(&legacy),
+            store
+                .files_for("phc_x", None, None)
+                .unwrap()
+                .contains(&legacy),
             "legacy file pruned away"
         );
         // Even a window that excludes its date keeps it: its partition is unknown.
         let d = chrono::NaiveDate::from_ymd_opt(2026, 7, 22).unwrap();
-        assert!(store.files_for("phc_x", Some(d), None).unwrap().contains(&legacy));
+        assert!(
+            store
+                .files_for("phc_x", Some(d), None)
+                .unwrap()
+                .contains(&legacy)
+        );
     }
 
     #[test]
@@ -503,8 +535,15 @@ mod tests {
         let store = EventStore::open(dir.path().to_path_buf()).unwrap();
         let paths = store.write_events(&[event("a")]).unwrap();
         let reader = SerializedFileReader::new(std::fs::File::open(&paths[0]).unwrap()).unwrap();
-        let kv = reader.metadata().file_metadata().key_value_metadata().unwrap();
-        let ver = kv.iter().find(|k| k.key == "hoglet_schema_version").unwrap();
+        let kv = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .unwrap();
+        let ver = kv
+            .iter()
+            .find(|k| k.key == "hoglet_schema_version")
+            .unwrap();
         assert_eq!(ver.value.as_deref(), Some(parquet::SCHEMA_VERSION));
     }
 }

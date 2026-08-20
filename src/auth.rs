@@ -96,13 +96,17 @@ impl AuthStore {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         Self::migrate(&conn)?;
-        Ok(AuthStore { conn: Mutex::new(conn) })
+        Ok(AuthStore {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, AuthError> {
         let conn = Connection::open_in_memory()?;
         Self::migrate(&conn)?;
-        Ok(AuthStore { conn: Mutex::new(conn) })
+        Ok(AuthStore {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn migrate(conn: &Connection) -> Result<(), AuthError> {
@@ -159,7 +163,12 @@ impl AuthStore {
 
     // ── First-run setup ──────────────────────────────────────
 
-    pub fn setup(&self, email: &str, password: &str, org_name: &str) -> Result<(User, Org, Project), AuthError> {
+    pub fn setup(
+        &self,
+        email: &str,
+        password: &str,
+        org_name: &str,
+    ) -> Result<(User, Org, Project), AuthError> {
         let conn = self.conn.lock().unwrap();
 
         let count: i64 = conn.query_row("SELECT count(*) FROM users", [], |r| r.get(0))?;
@@ -192,9 +201,21 @@ impl AuthStore {
         )?;
 
         Ok((
-            User { id: uid.clone(), email: email.into(), name: email.into() },
-            Org { id: oid.clone(), name: org_name.into() },
-            Project { id: pid, org_id: oid, name: "Default".into(), token },
+            User {
+                id: uid.clone(),
+                email: email.into(),
+                name: email.into(),
+            },
+            Org {
+                id: oid.clone(),
+                name: org_name.into(),
+            },
+            Project {
+                id: pid,
+                org_id: oid,
+                name: "Default".into(),
+                token,
+            },
         ))
     }
 
@@ -202,9 +223,12 @@ impl AuthStore {
 
     pub fn login(&self, email: &str, password: &str) -> Result<(User, String), AuthError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare_cached("SELECT id, email, pw_hash, name FROM users WHERE email = ?1")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT id, email, pw_hash, name FROM users WHERE email = ?1")?;
         let (uid, uemail, pw_hash, uname): (String, String, String, String) = stmt
-            .query_row([email], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .query_row([email], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .map_err(|_| AuthError::InvalidPassword)?;
 
         verify_password(&pw_hash, password).map_err(|_| AuthError::InvalidPassword)?;
@@ -217,7 +241,14 @@ impl AuthStore {
             rusqlite::params![sid, uid, now, expires],
         )?;
 
-        Ok((User { id: uid, email: uemail, name: uname }, sid))
+        Ok((
+            User {
+                id: uid,
+                email: uemail,
+                name: uname,
+            },
+            sid,
+        ))
     }
 
     pub fn validate_session(&self, session_id: &str) -> Result<User, AuthError> {
@@ -229,7 +260,11 @@ impl AuthStore {
              WHERE s.id = ?1 AND s.expires_at > ?2",
         )?;
         stmt.query_row(rusqlite::params![session_id, now], |r| {
-            Ok(User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)? })
+            Ok(User {
+                id: r.get(0)?,
+                email: r.get(1)?,
+                name: r.get(2)?,
+            })
         })
         .map_err(|_| AuthError::Unauthorized)
     }
@@ -242,7 +277,11 @@ impl AuthStore {
 
     // ── Personal API keys ────────────────────────────────────
 
-    pub fn create_api_key(&self, user_id: &str, name: &str) -> Result<(PersonalApiKey, String), AuthError> {
+    pub fn create_api_key(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<(PersonalApiKey, String), AuthError> {
         let conn = self.conn.lock().unwrap();
         let key = format!("phx_{}", Uuid::new_v4().to_string().replace('-', ""));
         let key_prefix = key[..12].to_string();
@@ -256,7 +295,16 @@ impl AuthStore {
             rusqlite::params![id, user_id, name, key_hash, key_prefix, now],
         )?;
 
-        Ok((PersonalApiKey { id, name: name.into(), key_prefix, last_used: None, created_at: now }, key))
+        Ok((
+            PersonalApiKey {
+                id,
+                name: name.into(),
+                key_prefix,
+                last_used: None,
+                created_at: now,
+            },
+            key,
+        ))
     }
 
     pub fn validate_api_key(&self, key: &str) -> Result<User, AuthError> {
@@ -278,7 +326,11 @@ impl AuthStore {
              WHERE k.key_hash = ?1",
         )?;
         stmt.query_row([key_hash], |r| {
-            Ok(User { id: r.get(0)?, email: r.get(1)?, name: r.get(2)? })
+            Ok(User {
+                id: r.get(0)?,
+                email: r.get(1)?,
+                name: r.get(2)?,
+            })
         })
         .map_err(|_| AuthError::Unauthorized)
     }
@@ -292,8 +344,11 @@ impl AuthStore {
         let rows = stmt
             .query_map([user_id], |r| {
                 Ok(PersonalApiKey {
-                    id: r.get(0)?, name: r.get(1)?, key_prefix: r.get(2)?,
-                    last_used: r.get(3)?, created_at: r.get(4)?,
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    key_prefix: r.get(2)?,
+                    last_used: r.get(3)?,
+                    created_at: r.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -306,7 +361,11 @@ impl AuthStore {
             "DELETE FROM personal_api_keys WHERE id = ?1 AND user_id = ?2",
             rusqlite::params![key_id, user_id],
         )?;
-        if affected == 0 { Err(AuthError::NotFound) } else { Ok(()) }
+        if affected == 0 {
+            Err(AuthError::NotFound)
+        } else {
+            Ok(())
+        }
     }
 
     // ── Orgs ─────────────────────────────────────────────────
@@ -318,7 +377,14 @@ impl AuthStore {
              JOIN org_members m ON o.id = m.org_id
              WHERE m.user_id = ?1 ORDER BY o.created_at",
         )?;
-        let rows = stmt.query_map([user_id], |r| Ok(Org { id: r.get(0)?, name: r.get(1)? }))?.collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([user_id], |r| {
+                Ok(Org {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -326,15 +392,33 @@ impl AuthStore {
         let conn = self.conn.lock().unwrap();
         let oid = Uuid::new_v4().to_string();
         let now = Utc::now().timestamp();
-        conn.execute("INSERT INTO orgs (id, name, created_at) VALUES (?1, ?2, ?3)", rusqlite::params![oid, name, now])?;
-        conn.execute("INSERT INTO org_members (org_id, user_id, role) VALUES (?1, ?2, 'owner')", rusqlite::params![oid, user_id])?;
-        Ok(Org { id: oid, name: name.into() })
+        conn.execute(
+            "INSERT INTO orgs (id, name, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![oid, name, now],
+        )?;
+        conn.execute(
+            "INSERT INTO org_members (org_id, user_id, role) VALUES (?1, ?2, 'owner')",
+            rusqlite::params![oid, user_id],
+        )?;
+        Ok(Org {
+            id: oid,
+            name: name.into(),
+        })
     }
 
     pub fn list_projects(&self, org_id: &str) -> Result<Vec<Project>, AuthError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached("SELECT id, org_id, name, token, created_at FROM projects WHERE org_id = ?1 ORDER BY created_at")?;
-        let rows = stmt.query_map([org_id], |r| Ok(Project { id: r.get(0)?, org_id: r.get(1)?, name: r.get(2)?, token: r.get(3)? }))?.collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([org_id], |r| {
+                Ok(Project {
+                    id: r.get(0)?,
+                    org_id: r.get(1)?,
+                    name: r.get(2)?,
+                    token: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -347,16 +431,23 @@ impl AuthStore {
             "INSERT INTO projects (id, org_id, name, token, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![pid, org_id, name, token, now],
         )?;
-        Ok(Project { id: pid, org_id: org_id.into(), name: name.into(), token })
+        Ok(Project {
+            id: pid,
+            org_id: org_id.into(),
+            name: name.into(),
+            token,
+        })
     }
 
     pub fn get_user_role(&self, user_id: &str, org_id: &str) -> Result<String, AuthError> {
         let conn = self.conn.lock().unwrap();
-        let role: String = conn.query_row(
-            "SELECT role FROM org_members WHERE org_id = ?1 AND user_id = ?2",
-            rusqlite::params![org_id, user_id],
-            |r| r.get(0),
-        ).map_err(|_| AuthError::Forbidden)?;
+        let role: String = conn
+            .query_row(
+                "SELECT role FROM org_members WHERE org_id = ?1 AND user_id = ?2",
+                rusqlite::params![org_id, user_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| AuthError::Forbidden)?;
         Ok(role)
     }
 }

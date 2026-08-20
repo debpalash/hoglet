@@ -141,13 +141,7 @@ impl CatalogStore {
                 let value = event.properties.get(key);
                 let type_guess = value.map(type_guess_for).unwrap_or("null");
 
-                stmt_key.execute(rusqlite::params![
-                    token,
-                    "event",
-                    key,
-                    type_guess,
-                    now
-                ])?;
+                stmt_key.execute(rusqlite::params![token, "event", key, type_guess, now])?;
 
                 if let Some(v) = value {
                     if !v.is_null() {
@@ -168,26 +162,25 @@ impl CatalogStore {
 }
 
 fn enforce_values_cap(conn: &Connection, token: &str) -> Result<(), CatalogError> {
-    let mut stmt = conn.prepare_cached(
-            "SELECT key FROM property_keys WHERE token = ?1 AND source = 'event'",
-        )?;
-        let keys: Vec<String> = stmt
-            .query_map([token], |r| r.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+    let mut stmt =
+        conn.prepare_cached("SELECT key FROM property_keys WHERE token = ?1 AND source = 'event'")?;
+    let keys: Vec<String> = stmt
+        .query_map([token], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
 
-        let mut del_stmt = conn.prepare_cached(
-            "DELETE FROM property_values WHERE token = ?1 AND key = ?2 AND value NOT IN (
+    let mut del_stmt = conn.prepare_cached(
+        "DELETE FROM property_values WHERE token = ?1 AND key = ?2 AND value NOT IN (
                 SELECT value FROM property_values WHERE token = ?1 AND key = ?2
                 ORDER BY count DESC LIMIT ?3
             )",
-        )?;
+    )?;
 
-        for key in keys {
-            del_stmt.execute(rusqlite::params![token, &key, VALUES_CAP_PER_KEY])?;
-        }
-
-        Ok(())
+    for key in keys {
+        del_stmt.execute(rusqlite::params![token, &key, VALUES_CAP_PER_KEY])?;
     }
+
+    Ok(())
+}
 
 impl CatalogStore {
     // ── Autocomplete APIs ──────────────────────────────────────
@@ -206,7 +199,9 @@ impl CatalogStore {
         )?;
         let pattern = format!("{prefix}%");
         let rows: Vec<String> = stmt
-            .query_map(rusqlite::params![token, &pattern, limit as i64], |r| r.get(0))?
+            .query_map(rusqlite::params![token, &pattern, limit as i64], |r| {
+                r.get(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -322,7 +317,11 @@ mod tests {
         let catalog = CatalogStore::open_in_memory().unwrap();
         catalog
             .ingest(
-                &[ev("pageview", vec![]), ev("click", vec![]), ev("pageview", vec![])],
+                &[
+                    ev("pageview", vec![]),
+                    ev("click", vec![]),
+                    ev("pageview", vec![]),
+                ],
                 "phc_t",
             )
             .unwrap();
@@ -394,12 +393,8 @@ mod tests {
     #[test]
     fn separate_tokens_have_separate_catalogs() {
         let catalog = CatalogStore::open_in_memory().unwrap();
-        catalog
-            .ingest(&[ev("pageview", vec![])], "phc_a")
-            .unwrap();
-        catalog
-            .ingest(&[ev("click", vec![])], "phc_b")
-            .unwrap();
+        catalog.ingest(&[ev("pageview", vec![])], "phc_a").unwrap();
+        catalog.ingest(&[ev("click", vec![])], "phc_b").unwrap();
 
         assert_eq!(catalog.all_event_names("phc_a").unwrap(), vec!["pageview"]);
         assert_eq!(catalog.all_event_names("phc_b").unwrap(), vec!["click"]);

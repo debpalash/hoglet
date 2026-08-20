@@ -4,6 +4,7 @@
 pub mod compile;
 pub mod ir;
 pub mod oracle;
+pub mod supported;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -14,6 +15,9 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 use ts_rs::TS;
 
+use crate::cache::{CacheKey, ResultCache, hash_ir};
+use crate::event_lake::{EventLakeError, EventScope, GenerationLease, VersionedEventLake};
+
 /// Wraps a DuckDB connection and returns it to the pool on drop.
 struct PooledConn {
     conn: Option<Connection>,
@@ -22,18 +26,22 @@ struct PooledConn {
 
 impl std::ops::Deref for PooledConn {
     type Target = Connection;
-    fn deref(&self) -> &Connection { self.conn.as_ref().unwrap() }
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().unwrap()
+    }
 }
 
 impl std::ops::DerefMut for PooledConn {
-    fn deref_mut(&mut self) -> &mut Connection { self.conn.as_mut().unwrap() }
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().unwrap()
+    }
 }
 
 impl Drop for PooledConn {
     fn drop(&mut self) {
         if let Some(c) = self.conn.take() {
             if let Ok(mut pool) = self.pool.lock() {
-                if pool.len() < MAX_CONCURRENT_QUERIES * 2 {
+                if pool.len() < MAX_CONCURRENT_QUERIES {
                     pool.push_back(c);
                 }
             }
@@ -42,12 +50,35 @@ impl Drop for PooledConn {
 }
 
 pub const MAX_FUNNEL_STEPS: usize = 12;
-pub const QUERY_MEMORY_LIMIT: &str = "256MB";
-pub const MAX_CONCURRENT_QUERIES: usize = 4;
+pub const QUERY_MEMORY_LIMIT: &str = "128MB";
+pub const MAX_CONCURRENT_QUERIES: usize = 1;
+pub const MAX_QUEUED_QUERIES: usize = 8;
+pub const MAX_QUERY_RESULT_ROWS: usize = 10_000;
+const MAX_CACHED_QUERY_RESULTS: usize = 200;
+
+pub struct QueryAdmission {
+    _execution: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBusy;
+
+fn configured_connection() -> Result<Connection, duckdb::Error> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(&format!(
+        "SET memory_limit='{QUERY_MEMORY_LIMIT}'; SET threads={MAX_CONCURRENT_QUERIES};"
+    ))?;
+    Ok(connection)
+}
 
 pub struct QueryEngine {
+    /// Present only for the explicitly versioned production query path.
+    event_lake: Option<Arc<VersionedEventLake>>,
+    /// Compatibility source for legacy routes and their tests.
     events_dir: PathBuf,
+    cache: Arc<ResultCache>,
     permits: Arc<Semaphore>,
+    queue_slots: Arc<Semaphore>,
     /// Pool of reusable in-memory DuckDB connections. Avoids ~50ms
     /// of init overhead per query.
     pool: Arc<Mutex<VecDeque<Connection>>>,
@@ -55,47 +86,146 @@ pub struct QueryEngine {
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub struct Stats { #[ts(type = "number")] pub total_events: i64, #[ts(type = "number")] pub unique_persons: i64, #[ts(type = "number")] pub events_24h: i64 }
+pub struct Stats {
+    #[ts(type = "number")]
+    pub total_events: i64,
+    #[ts(type = "number")]
+    pub unique_persons: i64,
+    #[ts(type = "number")]
+    pub events_24h: i64,
+}
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub struct TrendPoint { pub day: String, #[ts(type = "number")] pub count: i64 }
+pub struct TrendPoint {
+    pub day: String,
+    #[ts(type = "number")]
+    pub count: i64,
+}
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub struct EventCount { pub event: String, #[ts(type = "number")] pub count: i64 }
+pub struct EventCount {
+    pub event: String,
+    #[ts(type = "number")]
+    pub count: i64,
+}
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub struct FunnelStep { pub event: String, #[ts(type = "number")] pub reached: i64 }
+pub struct FunnelStep {
+    pub event: String,
+    #[ts(type = "number")]
+    pub reached: i64,
+}
 
 #[derive(Debug, Serialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub struct RecentEvent { pub uuid: String, pub event: String, pub distinct_id: String, pub timestamp: String }
+pub struct RecentEvent {
+    pub uuid: String,
+    pub event: String,
+    pub distinct_id: String,
+    pub timestamp: String,
+}
 
 #[derive(Debug)]
 pub enum QueryError {
     Db(duckdb::Error),
     TooManySteps,
     Compile(compile::CompileError),
+    EventLake(EventLakeError),
+    VersionedSourceRequired,
+    InvalidProjectRange,
 }
 
-impl From<duckdb::Error> for QueryError { fn from(e: duckdb::Error) -> Self { QueryError::Db(e) } }
-impl From<compile::CompileError> for QueryError { fn from(e: compile::CompileError) -> Self { QueryError::Compile(e) } }
+impl From<duckdb::Error> for QueryError {
+    fn from(e: duckdb::Error) -> Self {
+        QueryError::Db(e)
+    }
+}
+impl From<compile::CompileError> for QueryError {
+    fn from(e: compile::CompileError) -> Self {
+        QueryError::Compile(e)
+    }
+}
+
+impl From<EventLakeError> for QueryError {
+    fn from(error: EventLakeError) -> Self {
+        QueryError::EventLake(error)
+    }
+}
 
 impl QueryEngine {
     pub fn new(events_dir: PathBuf) -> Self {
+        Self::try_new(events_dir).expect("cannot configure the bounded DuckDB query engine")
+    }
+
+    /// Construct the query engine without hiding a failed resource setting.
+    pub fn try_new(events_dir: PathBuf) -> Result<Self, QueryError> {
+        Self::with_sources(events_dir, None)
+    }
+
+    /// Construct the production engine over immutable EventLake generations.
+    ///
+    /// Project queries acquire one generation lease per request and execute
+    /// against exactly the files selected by that lease. This constructor does
+    /// not reopen the event directory or discover Parquet files independently.
+    pub fn try_new_versioned(event_lake: Arc<VersionedEventLake>) -> Result<Self, QueryError> {
+        Self::with_sources(PathBuf::new(), Some(event_lake))
+    }
+
+    fn with_sources(
+        events_dir: PathBuf,
+        event_lake: Option<Arc<VersionedEventLake>>,
+    ) -> Result<Self, QueryError> {
         let mut pool = VecDeque::with_capacity(MAX_CONCURRENT_QUERIES);
         for _ in 0..MAX_CONCURRENT_QUERIES {
-            if let Ok(c) = Connection::open_in_memory() {
-                let _ = c.execute_batch(&format!("SET memory_limit='{QUERY_MEMORY_LIMIT}';"));
-                pool.push_back(c);
-            }
+            pool.push_back(configured_connection()?);
         }
-        Self { events_dir, permits: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)), pool: Arc::new(Mutex::new(pool)) }
+        Ok(Self {
+            event_lake,
+            events_dir,
+            cache: Arc::new(ResultCache::new(MAX_CACHED_QUERY_RESULTS)),
+            permits: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
+            queue_slots: Arc::new(Semaphore::new(MAX_QUEUED_QUERIES)),
+            pool: Arc::new(Mutex::new(pool)),
+        })
     }
-    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit { self.permits.clone().acquire_owned().await.expect("semaphore never closed") }
-    fn glob(&self) -> String { self.events_dir.join("**/*.parquet").to_string_lossy().into_owned() }
+    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed")
+    }
+
+    /// Enter the bounded dashboard query lane.
+    ///
+    /// Only waiters occupy `queue_slots`; once execution begins the slot is
+    /// released while the sole DuckDB permit remains held by `QueryAdmission`.
+    pub async fn admit(&self) -> Result<QueryAdmission, QueryBusy> {
+        let waiting = self
+            .queue_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| QueryBusy)?;
+        let execution = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| QueryBusy)?;
+        drop(waiting);
+        Ok(QueryAdmission {
+            _execution: execution,
+        })
+    }
+    fn glob(&self) -> String {
+        self.events_dir
+            .join("**/*.parquet")
+            .to_string_lossy()
+            .into_owned()
+    }
 
     /// The DuckDB source expression for one query.
     ///
@@ -118,23 +248,95 @@ impl QueryEngine {
             .unwrap_or(false)
     }
     fn conn(&self) -> Result<PooledConn, QueryError> {
-        let c = if let Ok(mut pool) = self.pool.lock() {
-            pool.pop_front()
-        } else {
-            None
-        };
-        let conn = match c {
-            Some(c) => c,
-            None => {
-                let c = Connection::open_in_memory()?;
-                c.execute_batch(&format!("SET memory_limit='{QUERY_MEMORY_LIMIT}';"))?;
-                c
-            }
-        };
-        Ok(PooledConn { conn: Some(conn), pool: self.pool.clone() })
+        let conn = self
+            .pool
+            .lock()
+            .map_err(|_| QueryError::Db(duckdb::Error::InvalidQuery))?
+            .pop_front()
+            .ok_or(QueryError::Db(duckdb::Error::InvalidQuery))?;
+        Ok(PooledConn {
+            conn: Some(conn),
+            pool: self.pool.clone(),
+        })
     }
 
-    pub fn run_ir(&self, query: &ir::Query, token: &str) -> Result<ir::QueryResponse, QueryError> {
+    /// Execute only query shapes whose semantics were accepted at the
+    /// [`supported::SupportedQuery`] seam.
+    pub fn run_supported(
+        &self,
+        query: &supported::SupportedQuery,
+        token: &str,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        self.run_trends_or_other(query.as_query(), token, std::time::Instant::now())
+    }
+
+    /// Execute a validated project query against one immutable generation.
+    ///
+    /// `project_id` and `capture_token` must both come from the same
+    /// `AuthorizedProject`; neither is accepted from the request body. The
+    /// generation id participates in both the response metadata and cache key.
+    pub fn run_supported_for_project(
+        &self,
+        query: &supported::SupportedQuery,
+        project_id: &str,
+        capture_token: &str,
+        refresh: bool,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        let event_lake = self
+            .event_lake
+            .as_ref()
+            .ok_or(QueryError::VersionedSourceRequired)?;
+        let (start_date, end_date_exclusive) = supported_scope(query)?;
+        let scope = EventScope::new(project_id, start_date, end_date_exclusive)?;
+        let lease = event_lake.acquire(&scope);
+        self.run_supported_with_lease(query, project_id, capture_token, refresh, lease)
+    }
+
+    fn run_supported_with_lease(
+        &self,
+        query: &supported::SupportedQuery,
+        project_id: &str,
+        capture_token: &str,
+        refresh: bool,
+        lease: GenerationLease,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        let generation_id = lease.generation_id().get();
+        let key = CacheKey {
+            token: format!("{project_id}\0{capture_token}"),
+            ir_hash: hash_ir(&serde_json::to_value(query.as_query()).unwrap_or_default()),
+            data_version: generation_id,
+        };
+        if !refresh
+            && let Some(bytes) = self.cache.get(&key)
+            && let Ok(mut response) = serde_json::from_slice::<ir::QueryResponse>(&bytes)
+        {
+            response.meta.cached = true;
+            return Ok(response);
+        }
+
+        let start = std::time::Instant::now();
+        let mut response = if lease.is_empty() {
+            empty_resp_at_generation(query.as_query(), "trends", start, generation_id)
+        } else {
+            let source = compile::file_list_source(&lease.paths());
+            self.run_trends_from_source(
+                query.as_query(),
+                capture_token,
+                &source,
+                start,
+                generation_id,
+            )?
+        };
+        response.meta.cached = false;
+        if let Ok(bytes) = serde_json::to_vec(&response) {
+            self.cache.put(key, bytes);
+        }
+        Ok(response)
+    }
+
+    /// Broad IR execution remains an internal compatibility path for legacy
+    /// methods and their tests. HTTP callers must cross `SupportedQuery` first.
+    fn run_ir(&self, query: &ir::Query, token: &str) -> Result<ir::QueryResponse, QueryError> {
         let start = std::time::Instant::now();
         match query.kind {
             ir::QueryKind::Funnels => self.run_funnels(query, token, start),
@@ -150,118 +352,515 @@ impl QueryEngine {
     /// Actor drill-down: one `SeriesResult` whose data points are people, with
     /// `interval` carrying the distinct_id and `count` their event count. Reuses
     /// the DataPoint shape so the frontend needs no new response type.
-    fn run_actors(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        if !self.has_data() { return Ok(empty_resp(query, "actors", start)); }
+    fn run_actors(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "actors", start));
+        }
         let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
-        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(String, i64)> = if vals.is_empty() { stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>,_>>()? }
-        else { let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect(); stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>,_>>()? };
+        let vals: Vec<duckdb::types::Value> = compiled
+            .params
+            .iter()
+            .map(compile::param_to_duckdb)
+            .collect();
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, i64)> = if vals.is_empty() {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let refs: Vec<&dyn duckdb::ToSql> =
+                vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let label = query
             .actors_config
             .as_ref()
             .and_then(|c| query.series.get(c.series_index))
             .map(|s| s.event_name())
             .unwrap_or_else(|| "Actors".into());
-        let results = vec![ir::SeriesResult { label, data: rows.into_iter().map(|(did, n)| ir::DataPoint { interval: did, count: n }).collect(), breakdown_value: None }];
-        Ok(ir::QueryResponse { results, meta: ir::QueryMeta { kind: "actors".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
+        let results = vec![ir::SeriesResult {
+            label,
+            data: rows
+                .into_iter()
+                .map(|(did, n)| ir::DataPoint {
+                    interval: did,
+                    count: n,
+                })
+                .collect(),
+            breakdown_value: None,
+        }];
+        Ok(ir::QueryResponse {
+            results,
+            meta: ir::QueryMeta {
+                kind: "actors".into(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id: 0,
+                cached: false,
+            },
+        })
     }
 
-    fn run_funnels(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        if !self.has_data() { return Ok(empty_resp(query, "funnels", start)); }
+    fn run_funnels(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "funnels", start));
+        }
         let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
         let sql = compile::finalize_sql(&compiled);
-        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(i64, String, i64)> = if vals.is_empty() { stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>,_>>()? }
-        else { let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect(); stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>,_>>()? };
-        Ok(ir::QueryResponse { results: rows.into_iter().map(|(step, label, reached)| ir::SeriesResult { label, data: vec![ir::DataPoint { interval: step.to_string(), count: reached }], breakdown_value: None }).collect(), meta: ir::QueryMeta { kind: "funnels".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
-    }
-
-    fn run_retention(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        if !self.has_data() { return Ok(empty_resp(query, "retention", start)); }
-        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
-        let sql = compile::finalize_sql(&compiled);
-        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(String, i64, i64)> = if vals.is_empty() { stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>,_>>()? }
-        else { let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect(); stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>,_>>()? };
-        let mut m: BTreeMap<String, Vec<ir::DataPoint>> = BTreeMap::new();
-        for (dt, p, u) in &rows { m.entry(dt.clone()).or_default().push(ir::DataPoint { interval: p.to_string(), count: *u }); }
-        Ok(ir::QueryResponse { results: m.into_iter().map(|(c, d)| ir::SeriesResult { label: format!("Cohort {c}"), data: d, breakdown_value: None }).collect(), meta: ir::QueryMeta { kind: "retention".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
-    }
-
-    fn run_sql(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        if !self.has_data() { return Ok(empty_resp(query, "sql", start)); }
-        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
-        let sql = compile::finalize_sql(&compiled);
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let cc = stmt.column_count();
-        let _rows = stmt.query_map([], |r| { let mut vs = Vec::with_capacity(cc); for i in 0..cc { let v: duckdb::types::Value = r.get(i)?; vs.push(match v { duckdb::types::Value::Text(s) => serde_json::Value::String(s), duckdb::types::Value::BigInt(n) => serde_json::json!(n), duckdb::types::Value::Double(f) => serde_json::json!(f), duckdb::types::Value::Boolean(b) => serde_json::Value::Bool(b), duckdb::types::Value::Null => serde_json::Value::Null, _ => serde_json::Value::String(format!("{v:?}")), }); } Ok(vs) })?.collect::<Result<Vec<Vec<serde_json::Value>>,_>>()?;
-        Ok(ir::QueryResponse { results: vec![], meta: ir::QueryMeta { kind: "sql".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
-    }
-
-    fn run_lifecycle(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        if !self.has_data() { return Ok(empty_resp(query, "lifecycle", start)); }
-        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
-        let sql = compile::finalize_sql(&compiled);
-        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(String, i64, i64, i64)> = if vals.is_empty() { stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>,_>>()? }
-        else { let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect(); stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<Vec<_>,_>>()? };
-        let results = vec![
-            ir::SeriesResult { label: "New".into(), data: rows.iter().map(|(p,n,_,_)| ir::DataPoint { interval: p.clone(), count: *n }).collect(), breakdown_value: None },
-            ir::SeriesResult { label: "Returning".into(), data: rows.iter().map(|(p,_,r,_)| ir::DataPoint { interval: p.clone(), count: *r }).collect(), breakdown_value: None },
-            ir::SeriesResult { label: "Resurrecting".into(), data: rows.iter().map(|(p,_,_,rs)| ir::DataPoint { interval: p.clone(), count: *rs }).collect(), breakdown_value: None },
-        ];
-        Ok(ir::QueryResponse { results, meta: ir::QueryMeta { kind: "lifecycle".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
-    }
-
-    fn run_stickiness(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        if !self.has_data() { return Ok(empty_resp(query, "stickiness", start)); }
-        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
-        let sql = compile::finalize_sql(&compiled);
-        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let rows: Vec<(String, i64)> = if vals.is_empty() { stmt.query_map([], |r| Ok((r.get::<_,i64>(0)?.to_string(), r.get(1)?)))?.collect::<Result<Vec<_>,_>>()? }
-        else { let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect(); stmt.query_map(refs.as_slice(), |r| Ok((r.get::<_,i64>(0)?.to_string(), r.get(1)?)))?.collect::<Result<Vec<_>,_>>()? };
-        let results = vec![ir::SeriesResult { label: "Stickiness".into(), data: rows.into_iter().map(|(c, u)| ir::DataPoint { interval: c, count: u }).collect(), breakdown_value: None }];
-        Ok(ir::QueryResponse { results, meta: ir::QueryMeta { kind: "stickiness".into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
-    }
-
-    fn run_trends_or_other(&self, query: &ir::Query, token: &str, start: std::time::Instant) -> Result<ir::QueryResponse, QueryError> {
-        let ns = query.series.len();
-        if !self.has_data() { return Ok(empty_resp(query, "trends", start)); }
-        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
-        let sql = compile::finalize_sql(&compiled);
-        let vals: Vec<duckdb::types::Value> = compiled.params.iter().map(compile::param_to_duckdb).collect();
-        let conn = self.conn()?; let mut stmt = conn.prepare(&sql)?;
-        let hb = query.breakdown.is_some(); let lo = if hb { 2 } else { 1 }; let co = if hb { 3 } else { 2 };
-        let rows: Vec<(String, Option<String>, Vec<(String, i64)>)> = if vals.is_empty() {
-            stmt.query_map([], move |r| { let iv: String = r.get(0)?; let bd: Option<String> = if hb { Some(r.get::<_,String>(1).unwrap_or_default()) } else { None }; let mut s = Vec::with_capacity(ns); for i in 0..ns { s.push((r.get::<_,String>(lo+2*i)?, r.get::<_,i64>(co+2*i)?)); } Ok((iv,bd,s)) })?.collect::<Result<Vec<_>,_>>()?
+        let vals: Vec<duckdb::types::Value> = compiled
+            .params
+            .iter()
+            .map(compile::param_to_duckdb)
+            .collect();
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(i64, String, i64)> = if vals.is_empty() {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
         } else {
-            let refs: Vec<&dyn duckdb::ToSql> = vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
-            stmt.query_map(refs.as_slice(), move |r| { let iv: String = r.get(0)?; let bd: Option<String> = if hb { Some(r.get::<_,String>(1).unwrap_or_default()) } else { None }; let mut s = Vec::with_capacity(ns); for i in 0..ns { s.push((r.get::<_,String>(lo+2*i)?, r.get::<_,i64>(co+2*i)?)); } Ok((iv,bd,s)) })?.collect::<Result<Vec<_>,_>>()?
+            let refs: Vec<&dyn duckdb::ToSql> =
+                vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(ir::QueryResponse {
+            results: rows
+                .into_iter()
+                .map(|(step, label, reached)| ir::SeriesResult {
+                    label,
+                    data: vec![ir::DataPoint {
+                        interval: step.to_string(),
+                        count: reached,
+                    }],
+                    breakdown_value: None,
+                })
+                .collect(),
+            meta: ir::QueryMeta {
+                kind: "funnels".into(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id: 0,
+                cached: false,
+            },
+        })
+    }
+
+    fn run_retention(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "retention", start));
+        }
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
+        let sql = compile::finalize_sql(&compiled);
+        let vals: Vec<duckdb::types::Value> = compiled
+            .params
+            .iter()
+            .map(compile::param_to_duckdb)
+            .collect();
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, i64, i64)> = if vals.is_empty() {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let refs: Vec<&dyn duckdb::ToSql> =
+                vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut m: BTreeMap<String, Vec<ir::DataPoint>> = BTreeMap::new();
+        for (dt, p, u) in &rows {
+            m.entry(dt.clone()).or_default().push(ir::DataPoint {
+                interval: p.to_string(),
+                count: *u,
+            });
+        }
+        Ok(ir::QueryResponse {
+            results: m
+                .into_iter()
+                .map(|(c, d)| ir::SeriesResult {
+                    label: format!("Cohort {c}"),
+                    data: d,
+                    breakdown_value: None,
+                })
+                .collect(),
+            meta: ir::QueryMeta {
+                kind: "retention".into(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id: 0,
+                cached: false,
+            },
+        })
+    }
+
+    fn run_sql(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "sql", start));
+        }
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
+        let sql = compile::finalize_sql(&compiled);
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let cc = stmt.column_count();
+        let _rows = stmt
+            .query_map([], |r| {
+                let mut vs = Vec::with_capacity(cc);
+                for i in 0..cc {
+                    let v: duckdb::types::Value = r.get(i)?;
+                    vs.push(match v {
+                        duckdb::types::Value::Text(s) => serde_json::Value::String(s),
+                        duckdb::types::Value::BigInt(n) => serde_json::json!(n),
+                        duckdb::types::Value::Double(f) => serde_json::json!(f),
+                        duckdb::types::Value::Boolean(b) => serde_json::Value::Bool(b),
+                        duckdb::types::Value::Null => serde_json::Value::Null,
+                        _ => serde_json::Value::String(format!("{v:?}")),
+                    });
+                }
+                Ok(vs)
+            })?
+            .take(MAX_QUERY_RESULT_ROWS)
+            .collect::<Result<Vec<Vec<serde_json::Value>>, _>>()?;
+        Ok(ir::QueryResponse {
+            results: vec![],
+            meta: ir::QueryMeta {
+                kind: "sql".into(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id: 0,
+                cached: false,
+            },
+        })
+    }
+
+    fn run_lifecycle(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "lifecycle", start));
+        }
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
+        let sql = compile::finalize_sql(&compiled);
+        let vals: Vec<duckdb::types::Value> = compiled
+            .params
+            .iter()
+            .map(compile::param_to_duckdb)
+            .collect();
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, i64, i64, i64)> = if vals.is_empty() {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let refs: Vec<&dyn duckdb::ToSql> =
+                vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            stmt.query_map(refs.as_slice(), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .take(MAX_QUERY_RESULT_ROWS)
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let results = vec![
+            ir::SeriesResult {
+                label: "New".into(),
+                data: rows
+                    .iter()
+                    .map(|(p, n, _, _)| ir::DataPoint {
+                        interval: p.clone(),
+                        count: *n,
+                    })
+                    .collect(),
+                breakdown_value: None,
+            },
+            ir::SeriesResult {
+                label: "Returning".into(),
+                data: rows
+                    .iter()
+                    .map(|(p, _, r, _)| ir::DataPoint {
+                        interval: p.clone(),
+                        count: *r,
+                    })
+                    .collect(),
+                breakdown_value: None,
+            },
+            ir::SeriesResult {
+                label: "Resurrecting".into(),
+                data: rows
+                    .iter()
+                    .map(|(p, _, _, rs)| ir::DataPoint {
+                        interval: p.clone(),
+                        count: *rs,
+                    })
+                    .collect(),
+                breakdown_value: None,
+            },
+        ];
+        Ok(ir::QueryResponse {
+            results,
+            meta: ir::QueryMeta {
+                kind: "lifecycle".into(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id: 0,
+                cached: false,
+            },
+        })
+    }
+
+    fn run_stickiness(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "stickiness", start));
+        }
+        let compiled = compile::compile(query, token, &self.source_for(query, token), None)?;
+        let sql = compile::finalize_sql(&compiled);
+        let vals: Vec<duckdb::types::Value> = compiled
+            .params
+            .iter()
+            .map(compile::param_to_duckdb)
+            .collect();
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let rows: Vec<(String, i64)> = if vals.is_empty() {
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?.to_string(), r.get(1)?)))?
+                .take(MAX_QUERY_RESULT_ROWS)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let refs: Vec<&dyn duckdb::ToSql> =
+                vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            stmt.query_map(refs.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?.to_string(), r.get(1)?))
+            })?
+            .take(MAX_QUERY_RESULT_ROWS)
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let results = vec![ir::SeriesResult {
+            label: "Stickiness".into(),
+            data: rows
+                .into_iter()
+                .map(|(c, u)| ir::DataPoint {
+                    interval: c,
+                    count: u,
+                })
+                .collect(),
+            breakdown_value: None,
+        }];
+        Ok(ir::QueryResponse {
+            results,
+            meta: ir::QueryMeta {
+                kind: "stickiness".into(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id: 0,
+                cached: false,
+            },
+        })
+    }
+
+    fn run_trends_or_other(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        start: std::time::Instant,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        if !self.has_data() {
+            return Ok(empty_resp(query, "trends", start));
+        }
+        let source = self.source_for(query, token);
+        self.run_trends_from_source(query, token, &source, start, 0)
+    }
+
+    fn run_trends_from_source(
+        &self,
+        query: &ir::Query,
+        token: &str,
+        source: &str,
+        start: std::time::Instant,
+        generation_id: u64,
+    ) -> Result<ir::QueryResponse, QueryError> {
+        let ns = query.series.len();
+        let compiled = compile::compile(query, token, source, None)?;
+        let sql = compile::finalize_sql(&compiled);
+        let vals: Vec<duckdb::types::Value> = compiled
+            .params
+            .iter()
+            .map(compile::param_to_duckdb)
+            .collect();
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let hb = query.breakdown.is_some();
+        let lo = if hb { 2 } else { 1 };
+        let co = if hb { 3 } else { 2 };
+        let rows: Vec<(String, Option<String>, Vec<(String, i64)>)> = if vals.is_empty() {
+            stmt.query_map([], move |r| {
+                let iv: String = r.get(0)?;
+                let bd: Option<String> = if hb {
+                    Some(r.get::<_, String>(1).unwrap_or_default())
+                } else {
+                    None
+                };
+                let mut s = Vec::with_capacity(ns);
+                for i in 0..ns {
+                    s.push((
+                        r.get::<_, String>(lo + 2 * i)?,
+                        r.get::<_, i64>(co + 2 * i)?,
+                    ));
+                }
+                Ok((iv, bd, s))
+            })?
+            .take(MAX_QUERY_RESULT_ROWS)
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let refs: Vec<&dyn duckdb::ToSql> =
+                vals.iter().map(|v| v as &dyn duckdb::ToSql).collect();
+            stmt.query_map(refs.as_slice(), move |r| {
+                let iv: String = r.get(0)?;
+                let bd: Option<String> = if hb {
+                    Some(r.get::<_, String>(1).unwrap_or_default())
+                } else {
+                    None
+                };
+                let mut s = Vec::with_capacity(ns);
+                for i in 0..ns {
+                    s.push((
+                        r.get::<_, String>(lo + 2 * i)?,
+                        r.get::<_, i64>(co + 2 * i)?,
+                    ));
+                }
+                Ok((iv, bd, s))
+            })?
+            .take(MAX_QUERY_RESULT_ROWS)
+            .collect::<Result<Vec<_>, _>>()?
         };
         let results = build_trends_results(hb, ns, &rows, query);
-        Ok(ir::QueryResponse { results, meta: ir::QueryMeta { kind: kind_str(query), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } })
+        Ok(ir::QueryResponse {
+            results,
+            meta: ir::QueryMeta {
+                kind: kind_str(query),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                generation_id,
+                cached: false,
+            },
+        })
     }
 
-    pub fn trend_via_ir(&self, token: &str, event: &str, days: u32) -> Result<Vec<TrendPoint>, QueryError> {
-        let q = ir::Query::trends(vec![ir::Series { event: ir::EventMatch::Name(event.into()), math: ir::Math::Total }], ir::DateRange { from: None, to: None, last_n: Some(ir::LastN::Days(days)) });
+    pub fn trend_via_ir(
+        &self,
+        token: &str,
+        event: &str,
+        days: u32,
+    ) -> Result<Vec<TrendPoint>, QueryError> {
+        let q = ir::Query::trends(
+            vec![ir::Series {
+                event: ir::EventMatch::Name(event.into()),
+                math: ir::Math::Total,
+            }],
+            ir::DateRange {
+                from: None,
+                to: None,
+                last_n: Some(ir::LastN::Days(days)),
+            },
+        );
         let r = self.run_ir(&q, token)?;
-        Ok(r.results.first().map(|s| s.data.iter().map(|d| TrendPoint { day: d.interval.clone(), count: d.count }).collect()).unwrap_or_default())
+        Ok(r.results
+            .first()
+            .map(|s| {
+                s.data
+                    .iter()
+                    .map(|d| TrendPoint {
+                        day: d.interval.clone(),
+                        count: d.count,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub fn stats_via_ir(&self, token: &str) -> Result<Stats, QueryError> {
-        let r = ir::DateRange { from: None, to: None, last_n: None };
-        let resp = self.run_ir(&ir::Query::trends(vec![ir::Series { event: ir::EventMatch::Any, math: ir::Math::Total }, ir::Series { event: ir::EventMatch::Any, math: ir::Math::Dau }], r.clone()), token)?;
-        let te: i64 = resp.results.get(0).map(|s| s.data.iter().map(|d| d.count).sum()).unwrap_or(0);
-        let up: i64 = resp.results.get(1).map(|s| s.data.iter().map(|d| d.count).sum()).unwrap_or(0);
-        let r24 = self.run_ir(&ir::Query::trends(vec![ir::Series { event: ir::EventMatch::Any, math: ir::Math::Total }], ir::DateRange { from: None, to: None, last_n: Some(ir::LastN::Hours(24)) }), token)?;
-        let e24: i64 = r24.results.first().map(|s| s.data.iter().map(|d| d.count).sum()).unwrap_or(0);
-        Ok(Stats { total_events: te, unique_persons: up, events_24h: e24 })
+        let r = ir::DateRange {
+            from: None,
+            to: None,
+            last_n: None,
+        };
+        let resp = self.run_ir(
+            &ir::Query::trends(
+                vec![
+                    ir::Series {
+                        event: ir::EventMatch::Any,
+                        math: ir::Math::Total,
+                    },
+                    ir::Series {
+                        event: ir::EventMatch::Any,
+                        math: ir::Math::Dau,
+                    },
+                ],
+                r.clone(),
+            ),
+            token,
+        )?;
+        let te: i64 = resp
+            .results
+            .get(0)
+            .map(|s| s.data.iter().map(|d| d.count).sum())
+            .unwrap_or(0);
+        let up: i64 = resp
+            .results
+            .get(1)
+            .map(|s| s.data.iter().map(|d| d.count).sum())
+            .unwrap_or(0);
+        let r24 = self.run_ir(
+            &ir::Query::trends(
+                vec![ir::Series {
+                    event: ir::EventMatch::Any,
+                    math: ir::Math::Total,
+                }],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: Some(ir::LastN::Hours(24)),
+                },
+            ),
+            token,
+        )?;
+        let e24: i64 = r24
+            .results
+            .first()
+            .map(|s| s.data.iter().map(|d| d.count).sum())
+            .unwrap_or(0);
+        Ok(Stats {
+            total_events: te,
+            unique_persons: up,
+            events_24h: e24,
+        })
     }
 
     // ── Legacy SQL methods (preserved, P0) ──
@@ -275,28 +874,152 @@ impl QueryEngine {
             _ => compile::glob_source(&self.glob()),
         }
     }
-    fn base_cte(&self) -> String { format!("WITH e AS (SELECT * FROM read_parquet({}) QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1)", self.all_files_source()) }
-    pub fn stats(&self, token: &str) -> Result<Stats, QueryError> { if !self.has_data() { return Ok(Stats { total_events: 0, unique_persons: 0, events_24h: 0 }); } let c = self.conn()?; let sql = format!("{} SELECT count(*) AS total, count(DISTINCT distinct_id) AS persons, count(*) FILTER (WHERE epoch(timestamp) >= epoch(now()) - 86400) AS last24 FROM e WHERE token = ?", self.base_cte()); c.query_row(&sql, [token], |r| Ok(Stats { total_events: r.get(0)?, unique_persons: r.get(1)?, events_24h: r.get(2)? })).map_err(|e| e.into()) }
-    pub fn top_events(&self, token: &str, limit: usize) -> Result<Vec<EventCount>, QueryError> { if !self.has_data() { return Ok(vec![]); } let c = self.conn()?; let sql = format!("{} SELECT event, count(*) c FROM e WHERE token = ? GROUP BY event ORDER BY c DESC LIMIT {}", self.base_cte(), limit); let mut s = c.prepare(&sql)?; s.query_map([token], |r| Ok(EventCount { event: r.get(0)?, count: r.get(1)? }))?.collect::<Result<Vec<_>,_>>().map_err(|e| e.into()) }
-    pub fn trend(&self, token: &str, event: &str, days: u32) -> Result<Vec<TrendPoint>, QueryError> { if !self.has_data() { return Ok(vec![]); } let c = self.conn()?; let sql = format!("{} SELECT strftime(timestamp, '%Y-%m-%d') d, count(*) c FROM e WHERE token = ? AND event = ? AND epoch(timestamp) >= epoch(now()) - ({} * 86400) GROUP BY d ORDER BY d", self.base_cte(), days); let mut s = c.prepare(&sql)?; s.query_map([token, event], |r| Ok(TrendPoint { day: r.get(0)?, count: r.get(1)? }))?.collect::<Result<Vec<_>,_>>().map_err(|e| e.into()) }
-    pub fn funnel(&self, token: &str, steps: &[String]) -> Result<Vec<FunnelStep>, QueryError> {
-        if steps.is_empty() { return Ok(vec![]); }
-        if steps.len() > MAX_FUNNEL_STEPS { return Err(QueryError::TooManySteps); }
-        if !self.has_data() { return Ok(steps.iter().map(|s| FunnelStep { event: s.clone(), reached: 0 }).collect()); }
+    fn base_cte(&self) -> String {
+        format!(
+            "WITH e AS (SELECT * FROM read_parquet({}) QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1)",
+            self.all_files_source()
+        )
+    }
+    pub fn stats(&self, token: &str) -> Result<Stats, QueryError> {
+        if !self.has_data() {
+            return Ok(Stats {
+                total_events: 0,
+                unique_persons: 0,
+                events_24h: 0,
+            });
+        }
         let c = self.conn()?;
-        let mut ctes = vec![format!("s0 AS (SELECT distinct_id, min(timestamp) t FROM e WHERE token = ? AND event = ? GROUP BY distinct_id)")];
+        let sql = format!(
+            "{} SELECT count(*) AS total, count(DISTINCT distinct_id) AS persons, count(*) FILTER (WHERE epoch(timestamp) >= epoch(now()) - 86400) AS last24 FROM e WHERE token = ?",
+            self.base_cte()
+        );
+        c.query_row(&sql, [token], |r| {
+            Ok(Stats {
+                total_events: r.get(0)?,
+                unique_persons: r.get(1)?,
+                events_24h: r.get(2)?,
+            })
+        })
+        .map_err(|e| e.into())
+    }
+    pub fn top_events(&self, token: &str, limit: usize) -> Result<Vec<EventCount>, QueryError> {
+        if !self.has_data() {
+            return Ok(vec![]);
+        }
+        let c = self.conn()?;
+        let sql = format!(
+            "{} SELECT event, count(*) c FROM e WHERE token = ? GROUP BY event ORDER BY c DESC, event LIMIT {}",
+            self.base_cte(),
+            limit.min(MAX_QUERY_RESULT_ROWS)
+        );
+        let mut s = c.prepare(&sql)?;
+        s.query_map([token], |r| {
+            Ok(EventCount {
+                event: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.into())
+    }
+    pub fn trend(
+        &self,
+        token: &str,
+        event: &str,
+        days: u32,
+    ) -> Result<Vec<TrendPoint>, QueryError> {
+        if !self.has_data() {
+            return Ok(vec![]);
+        }
+        let c = self.conn()?;
+        let sql = format!(
+            "{} SELECT strftime(timestamp, '%Y-%m-%d') d, count(*) c FROM e WHERE token = ? AND event = ? AND epoch(timestamp) >= epoch(now()) - ({} * 86400) GROUP BY d ORDER BY d LIMIT {}",
+            self.base_cte(),
+            days,
+            MAX_QUERY_RESULT_ROWS
+        );
+        let mut s = c.prepare(&sql)?;
+        s.query_map([token, event], |r| {
+            Ok(TrendPoint {
+                day: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.into())
+    }
+    pub fn funnel(&self, token: &str, steps: &[String]) -> Result<Vec<FunnelStep>, QueryError> {
+        if steps.is_empty() {
+            return Ok(vec![]);
+        }
+        if steps.len() > MAX_FUNNEL_STEPS {
+            return Err(QueryError::TooManySteps);
+        }
+        if !self.has_data() {
+            return Ok(steps
+                .iter()
+                .map(|s| FunnelStep {
+                    event: s.clone(),
+                    reached: 0,
+                })
+                .collect());
+        }
+        let c = self.conn()?;
+        let mut ctes = vec![format!(
+            "s0 AS (SELECT distinct_id, min(timestamp) t FROM e WHERE token = ? AND event = ? GROUP BY distinct_id)"
+        )];
         for i in 1..steps.len() {
             ctes.push(format!("s{i} AS (SELECT s{p}.distinct_id, min(e.timestamp) t FROM s{p} JOIN e ON e.distinct_id = s{p}.distinct_id AND e.token = ? AND e.event = ? AND e.timestamp >= s{p}.t GROUP BY s{p}.distinct_id)", i=i, p=i-1));
         }
-        let counts: Vec<String> = (0..steps.len()).map(|i| format!("SELECT {i} AS step, count(*) AS reached FROM s{i}")).collect();
-        let sql = format!("{}, {} {} ORDER BY step", self.base_cte(), ctes.join(", "), counts.join(" UNION ALL "));
+        let counts: Vec<String> = (0..steps.len())
+            .map(|i| format!("SELECT {i} AS step, count(*) AS reached FROM s{i}"))
+            .collect();
+        let sql = format!(
+            "{}, {} {} ORDER BY step",
+            self.base_cte(),
+            ctes.join(", "),
+            counts.join(" UNION ALL ")
+        );
         let mut params: Vec<&dyn duckdb::ToSql> = Vec::new();
-        for step in steps { params.push(&token); params.push(step); }
+        for step in steps {
+            params.push(&token);
+            params.push(step);
+        }
         let mut s = c.prepare(&sql)?;
-        let reached: Vec<i64> = s.query_map(params.as_slice(), |r| r.get::<_,i64>(1))?.collect::<Result<Vec<_>,_>>()?;
-        Ok(steps.iter().zip(reached).map(|(e,r)| FunnelStep { event: e.clone(), reached: r }).collect())
+        let reached: Vec<i64> = s
+            .query_map(params.as_slice(), |r| r.get::<_, i64>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(steps
+            .iter()
+            .zip(reached)
+            .map(|(e, r)| FunnelStep {
+                event: e.clone(),
+                reached: r,
+            })
+            .collect())
     }
-    pub fn recent_events(&self, token: &str, limit: usize) -> Result<Vec<RecentEvent>, QueryError> { if !self.has_data() { return Ok(vec![]); } let c = self.conn()?; let sql = format!("{} SELECT uuid, event, distinct_id, strftime(timestamp, '%Y-%m-%dT%H:%M:%SZ') ts FROM e WHERE token = ? ORDER BY timestamp DESC LIMIT {}", self.base_cte(), limit); let mut s = c.prepare(&sql)?; s.query_map([token], |r| Ok(RecentEvent { uuid: r.get(0)?, event: r.get(1)?, distinct_id: r.get(2)?, timestamp: r.get(3)? }))?.collect::<Result<Vec<_>,_>>().map_err(|e| e.into()) }
+    pub fn recent_events(&self, token: &str, limit: usize) -> Result<Vec<RecentEvent>, QueryError> {
+        if !self.has_data() {
+            return Ok(vec![]);
+        }
+        let c = self.conn()?;
+        let sql = format!(
+            "{} SELECT uuid, event, distinct_id, strftime(timestamp, '%Y-%m-%dT%H:%M:%SZ') ts FROM e WHERE token = ? ORDER BY timestamp DESC, uuid LIMIT {}",
+            self.base_cte(),
+            limit.min(MAX_QUERY_RESULT_ROWS)
+        );
+        let mut s = c.prepare(&sql)?;
+        s.query_map([token], |r| {
+            Ok(RecentEvent {
+                uuid: r.get(0)?,
+                event: r.get(1)?,
+                distinct_id: r.get(2)?,
+                timestamp: r.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.into())
+    }
 }
 
 /// Widest UTC date window a range can touch, for partition pruning.
@@ -307,9 +1030,7 @@ impl QueryEngine {
 fn range_dates(range: &ir::DateRange) -> (Option<chrono::NaiveDate>, Option<chrono::NaiveDate>) {
     use chrono::{Duration, Utc};
 
-    let parse = |s: &str| {
-        chrono::NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d").ok()
-    };
+    let parse = |s: &str| chrono::NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d").ok();
     let mut from = range.from.as_deref().and_then(parse);
     let to = range.to.as_deref().and_then(parse);
 
@@ -328,28 +1049,141 @@ fn range_dates(range: &ir::DateRange) -> (Option<chrono::NaiveDate>, Option<chro
     (from, to)
 }
 
+fn supported_scope(
+    query: &supported::SupportedQuery,
+) -> Result<(chrono::NaiveDate, chrono::NaiveDate), QueryError> {
+    let range = &query.as_query().range;
+    let from = range
+        .from
+        .as_deref()
+        .ok_or(QueryError::InvalidProjectRange)
+        .and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(value).map_err(|_| QueryError::InvalidProjectRange)
+        })?
+        .to_utc()
+        .date_naive();
+    let through = range
+        .to
+        .as_deref()
+        .ok_or(QueryError::InvalidProjectRange)
+        .and_then(|value| {
+            chrono::DateTime::parse_from_rfc3339(value).map_err(|_| QueryError::InvalidProjectRange)
+        })?
+        .to_utc()
+        .date_naive();
+    let end_exclusive = through
+        .checked_add_days(chrono::Days::new(1))
+        .ok_or(QueryError::InvalidProjectRange)?;
+    Ok((from, end_exclusive))
+}
+
 fn empty_resp(query: &ir::Query, kind: &str, start: std::time::Instant) -> ir::QueryResponse {
+    empty_resp_at_generation(query, kind, start, 0)
+}
+
+fn empty_resp_at_generation(
+    query: &ir::Query,
+    kind: &str,
+    start: std::time::Instant,
+    generation_id: u64,
+) -> ir::QueryResponse {
     let results = match query.kind {
-        ir::QueryKind::Funnels => query.series.iter().map(|s| ir::SeriesResult { label: s.event_name(), data: vec![], breakdown_value: None }).collect(),
-        _ => query.series.iter().enumerate().map(|(i, s)| ir::SeriesResult { label: compile::series_label(s, i), data: vec![], breakdown_value: None }).collect(),
+        ir::QueryKind::Funnels => query
+            .series
+            .iter()
+            .map(|s| ir::SeriesResult {
+                label: s.event_name(),
+                data: vec![],
+                breakdown_value: None,
+            })
+            .collect(),
+        _ => query
+            .series
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ir::SeriesResult {
+                label: compile::series_label(s, i),
+                data: vec![],
+                breakdown_value: None,
+            })
+            .collect(),
     };
-    ir::QueryResponse { results, meta: ir::QueryMeta { kind: kind.into(), elapsed_ms: start.elapsed().as_millis() as u64, cached: false } }
+    ir::QueryResponse {
+        results,
+        meta: ir::QueryMeta {
+            kind: kind.into(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            generation_id,
+            cached: false,
+        },
+    }
 }
 
 fn kind_str(query: &ir::Query) -> String {
-    match query.kind { ir::QueryKind::Trends => "trends".into(), ir::QueryKind::Funnels => "funnels".into(), ir::QueryKind::Retention => "retention".into(), ir::QueryKind::Sql => "sql".into(), _ => format!("{:?}", query.kind).to_lowercase() }
+    match query.kind {
+        ir::QueryKind::Trends => "trends".into(),
+        ir::QueryKind::Funnels => "funnels".into(),
+        ir::QueryKind::Retention => "retention".into(),
+        ir::QueryKind::Sql => "sql".into(),
+        _ => format!("{:?}", query.kind).to_lowercase(),
+    }
 }
 
-fn build_trends_results(has_bd: bool, ns: usize, rows: &[(String, Option<String>, Vec<(String, i64)>)], query: &ir::Query) -> Vec<ir::SeriesResult> {
+fn build_trends_results(
+    has_bd: bool,
+    ns: usize,
+    rows: &[(String, Option<String>, Vec<(String, i64)>)],
+    query: &ir::Query,
+) -> Vec<ir::SeriesResult> {
     if has_bd {
-        let mut cm: std::collections::HashMap<(String, String), Vec<ir::DataPoint>> = std::collections::HashMap::new();
+        let mut cm: std::collections::HashMap<(String, String), Vec<ir::DataPoint>> =
+            std::collections::HashMap::new();
         let mut co: Vec<(String, String)> = Vec::new();
-        for (iv, bd, sd) in rows { let b = bd.clone().unwrap_or_default(); for (_i, (l, c)) in sd.iter().enumerate() { let k = (l.clone(), b.clone()); if !cm.contains_key(&k) { co.push(k.clone()); cm.insert(k.clone(), vec![]); } cm.get_mut(&k).unwrap().push(ir::DataPoint { interval: iv.clone(), count: *c }); } }
-        co.iter().map(|(l, b)| ir::SeriesResult { label: l.clone(), data: cm.remove(&(l.clone(), b.clone())).unwrap_or_default(), breakdown_value: Some(b.clone()) }).collect()
+        for (iv, bd, sd) in rows {
+            let b = bd.clone().unwrap_or_default();
+            for (_i, (l, c)) in sd.iter().enumerate() {
+                let k = (l.clone(), b.clone());
+                if !cm.contains_key(&k) {
+                    co.push(k.clone());
+                    cm.insert(k.clone(), vec![]);
+                }
+                cm.get_mut(&k).unwrap().push(ir::DataPoint {
+                    interval: iv.clone(),
+                    count: *c,
+                });
+            }
+        }
+        co.iter()
+            .map(|(l, b)| ir::SeriesResult {
+                label: l.clone(),
+                data: cm.remove(&(l.clone(), b.clone())).unwrap_or_default(),
+                breakdown_value: Some(b.clone()),
+            })
+            .collect()
     } else {
-        let mut r: Vec<ir::SeriesResult> = (0..ns).map(|_| ir::SeriesResult { label: String::new(), data: vec![], breakdown_value: None }).collect();
-        for (iv, _, sd) in rows { for (i, (l, c)) in sd.iter().enumerate() { if r[i].label.is_empty() { r[i].label = l.clone(); } r[i].data.push(ir::DataPoint { interval: iv.clone(), count: *c }); } }
-        for (i, s) in query.series.iter().enumerate() { if i < r.len() && r[i].label.is_empty() { r[i].label = compile::series_label(s, i); } }
+        let mut r: Vec<ir::SeriesResult> = (0..ns)
+            .map(|_| ir::SeriesResult {
+                label: String::new(),
+                data: vec![],
+                breakdown_value: None,
+            })
+            .collect();
+        for (iv, _, sd) in rows {
+            for (i, (l, c)) in sd.iter().enumerate() {
+                if r[i].label.is_empty() {
+                    r[i].label = l.clone();
+                }
+                r[i].data.push(ir::DataPoint {
+                    interval: iv.clone(),
+                    count: *c,
+                });
+            }
+        }
+        for (i, s) in query.series.iter().enumerate() {
+            if i < r.len() && r[i].label.is_empty() {
+                r[i].label = compile::series_label(s, i);
+            }
+        }
         r
     }
 }
@@ -364,52 +1198,571 @@ mod tests {
     use uuid::Uuid;
 
     fn ev(event: &str, did: &str, ago_hours: i64) -> CapturedEvent {
-        CapturedEvent { uuid: Uuid::new_v4(), event: event.into(), distinct_id: did.into(), token: "phc_t".into(), timestamp: Utc::now() - Duration::hours(ago_hours), properties: Map::new() }
+        CapturedEvent {
+            uuid: Uuid::new_v4(),
+            event: event.into(),
+            distinct_id: did.into(),
+            token: "phc_t".into(),
+            timestamp: Utc::now() - Duration::hours(ago_hours),
+            properties: Map::new(),
+        }
     }
-    fn evp(event: &str, did: &str, ago_hours: i64, props: Vec<(&str, serde_json::Value)>) -> CapturedEvent {
-        let mut m = Map::new(); for (k,v) in props { m.insert(k.into(), v); }
-        CapturedEvent { uuid: Uuid::new_v4(), event: event.into(), distinct_id: did.into(), token: "phc_t".into(), timestamp: Utc::now() - Duration::hours(ago_hours), properties: m }
+    fn evp(
+        event: &str,
+        did: &str,
+        ago_hours: i64,
+        props: Vec<(&str, serde_json::Value)>,
+    ) -> CapturedEvent {
+        let mut m = Map::new();
+        for (k, v) in props {
+            m.insert(k.into(), v);
+        }
+        CapturedEvent {
+            uuid: Uuid::new_v4(),
+            event: event.into(),
+            distinct_id: did.into(),
+            token: "phc_t".into(),
+            timestamp: Utc::now() - Duration::hours(ago_hours),
+            properties: m,
+        }
     }
     fn engine_with(events: &[CapturedEvent]) -> (tempfile::TempDir, QueryEngine) {
-        let dir = tempfile::tempdir().unwrap(); let p = dir.path().to_path_buf(); let store = EventStore::open(p.clone()).unwrap(); store.write_events(events).unwrap(); (dir, QueryEngine::new(p))
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_path_buf();
+        let store = EventStore::open(p.clone()).unwrap();
+        store.write_events(events).unwrap();
+        (dir, QueryEngine::new(p))
     }
     fn assert_oracle(events: &[CapturedEvent], query: &ir::Query) {
         let (_d, e) = engine_with(events);
         let dd = e.run_ir(query, "phc_t").unwrap();
         let oo = oracle::run_ir(events, query, "phc_t");
-        let dm: std::collections::HashMap<_,Vec<i64>> = dd.results.iter().map(|s| ((s.label.clone(),s.breakdown_value.clone()), s.data.iter().map(|d| d.count).collect())).collect();
-        let om: std::collections::HashMap<_,Vec<i64>> = oo.results.iter().map(|s| ((s.label.clone(),s.breakdown_value.clone()), s.data.iter().map(|d| d.count).collect())).collect();
+        let dm: std::collections::HashMap<_, Vec<i64>> = dd
+            .results
+            .iter()
+            .map(|s| {
+                (
+                    (s.label.clone(), s.breakdown_value.clone()),
+                    s.data.iter().map(|d| d.count).collect(),
+                )
+            })
+            .collect();
+        let om: std::collections::HashMap<_, Vec<i64>> = oo
+            .results
+            .iter()
+            .map(|s| {
+                (
+                    (s.label.clone(), s.breakdown_value.clone()),
+                    s.data.iter().map(|d| d.count).collect(),
+                )
+            })
+            .collect();
         assert_eq!(dm, om);
     }
 
     // ── P0 legacy tests ──
-    #[test] fn stats_count() { let (_d,e) = engine_with(&[ev("pv","u1",1),ev("pv","u1",2),ev("ck","u2",100)]); let s = e.stats("phc_t").unwrap(); assert_eq!(s.total_events,3); assert_eq!(s.unique_persons,2); assert_eq!(s.events_24h,2); }
-    #[test] fn empty_store() { let d=tempfile::tempdir().unwrap(); EventStore::open(d.path().to_path_buf()).unwrap(); let e=QueryEngine::new(d.path().to_path_buf()); assert_eq!(e.stats("phc_t").unwrap().total_events,0); assert!(e.top_events("phc_t",10).unwrap().is_empty()); }
-    #[test] fn dup_uuid_once() { let mut e1=ev("pv","u1",1); e1.uuid=Uuid::from_u128(42); let d=tempfile::tempdir().unwrap(); let s=EventStore::open(d.path().to_path_buf()).unwrap(); s.write_events(&[e1.clone()]).unwrap(); s.write_events(&[e1]).unwrap(); assert_eq!(QueryEngine::new(d.path().to_path_buf()).stats("phc_t").unwrap().total_events,1); }
-    #[test] fn top_ordered() { let (_d,e)=engine_with(&[ev("a","u1",1),ev("a","u2",1),ev("b","u1",1)]); let t=e.top_events("phc_t",10).unwrap(); assert_eq!(t[0].event,"a"); assert_eq!(t[0].count,2); }
-    #[test] fn funnel_mono() { let evs=&[ev("s","u1",5),ev("a","u1",4),ev("p","u1",3),ev("s","u2",5),ev("a","u2",4),ev("s","u3",5)]; let (_d,e)=engine_with(evs); let f=e.funnel("phc_t",&["s".into(),"a".into(),"p".into()]).unwrap(); assert_eq!(f[0].reached,3); assert_eq!(f[1].reached,2); assert_eq!(f[2].reached,1); }
-    #[test] fn funnel_order() { let (_d,e)=engine_with(&[ev("p","u1",10),ev("s","u1",5)]); let f=e.funnel("phc_t",&["s".into(),"p".into()]).unwrap(); assert_eq!(f[0].reached,1); assert_eq!(f[1].reached,0); }
-    #[test] fn recent_newest() { let (_d,e)=engine_with(&[ev("o","u1",10),ev("n","u1",1)]); assert_eq!(e.recent_events("phc_t",10).unwrap()[0].event,"n"); }
+    #[test]
+    fn stats_count() {
+        let (_d, e) = engine_with(&[ev("pv", "u1", 1), ev("pv", "u1", 2), ev("ck", "u2", 100)]);
+        let s = e.stats("phc_t").unwrap();
+        assert_eq!(s.total_events, 3);
+        assert_eq!(s.unique_persons, 2);
+        assert_eq!(s.events_24h, 2);
+    }
+    #[test]
+    fn empty_store() {
+        let d = tempfile::tempdir().unwrap();
+        EventStore::open(d.path().to_path_buf()).unwrap();
+        let e = QueryEngine::new(d.path().to_path_buf());
+        assert_eq!(e.stats("phc_t").unwrap().total_events, 0);
+        assert!(e.top_events("phc_t", 10).unwrap().is_empty());
+    }
+    #[test]
+    fn dup_uuid_once() {
+        let mut e1 = ev("pv", "u1", 1);
+        e1.uuid = Uuid::from_u128(42);
+        let d = tempfile::tempdir().unwrap();
+        let s = EventStore::open(d.path().to_path_buf()).unwrap();
+        s.write_events(&[e1.clone()]).unwrap();
+        s.write_events(&[e1]).unwrap();
+        assert_eq!(
+            QueryEngine::new(d.path().to_path_buf())
+                .stats("phc_t")
+                .unwrap()
+                .total_events,
+            1
+        );
+    }
+    #[test]
+    fn same_uuid_in_two_projects_is_not_cross_project_deduplicated() {
+        let mut first = ev("pv", "u1", 1);
+        first.uuid = Uuid::from_u128(42);
+        let mut second = first.clone();
+        second.token = "phc_other".into();
+        second.distinct_id = "u2".into();
+        let (_dir, engine) = engine_with(&[first, second]);
+
+        assert_eq!(engine.stats("phc_t").unwrap().total_events, 1);
+        assert_eq!(engine.stats("phc_other").unwrap().total_events, 1);
+    }
+
+    #[test]
+    fn engine_has_one_strictly_configured_duckdb_connection() {
+        assert_eq!(MAX_CONCURRENT_QUERIES, 1);
+        assert_eq!(QUERY_MEMORY_LIMIT, "128MB");
+        let engine = QueryEngine::try_new(std::path::PathBuf::from("unused")).unwrap();
+        let connection = engine.conn().unwrap();
+        let threads: i64 = connection
+            .query_row("SELECT current_setting('threads')", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(threads, 1);
+        assert!(matches!(
+            engine.conn(),
+            Err(QueryError::Db(duckdb::Error::InvalidQuery))
+        ));
+        drop(connection);
+        assert!(engine.conn().is_ok());
+    }
+    #[test]
+    fn top_ordered() {
+        let (_d, e) = engine_with(&[ev("a", "u1", 1), ev("a", "u2", 1), ev("b", "u1", 1)]);
+        let t = e.top_events("phc_t", 10).unwrap();
+        assert_eq!(t[0].event, "a");
+        assert_eq!(t[0].count, 2);
+    }
+    #[test]
+    fn funnel_mono() {
+        let evs = &[
+            ev("s", "u1", 5),
+            ev("a", "u1", 4),
+            ev("p", "u1", 3),
+            ev("s", "u2", 5),
+            ev("a", "u2", 4),
+            ev("s", "u3", 5),
+        ];
+        let (_d, e) = engine_with(evs);
+        let f = e
+            .funnel("phc_t", &["s".into(), "a".into(), "p".into()])
+            .unwrap();
+        assert_eq!(f[0].reached, 3);
+        assert_eq!(f[1].reached, 2);
+        assert_eq!(f[2].reached, 1);
+    }
+    #[test]
+    fn funnel_order() {
+        let (_d, e) = engine_with(&[ev("p", "u1", 10), ev("s", "u1", 5)]);
+        let f = e.funnel("phc_t", &["s".into(), "p".into()]).unwrap();
+        assert_eq!(f[0].reached, 1);
+        assert_eq!(f[1].reached, 0);
+    }
+    #[test]
+    fn recent_newest() {
+        let (_d, e) = engine_with(&[ev("o", "u1", 10), ev("n", "u1", 1)]);
+        assert_eq!(e.recent_events("phc_t", 10).unwrap()[0].event, "n");
+    }
 
     // ── P1 IR tests ──
-    #[test] fn ir_trends_total() { let q=ir::Query::trends(vec![ir::Series{event:ir::EventMatch::Name("pv".into()),math:ir::Math::Total}],ir::DateRange{from:None,to:None,last_n:None}); assert_oracle(&[ev("pv","u1",1),ev("pv","u1",2),ev("pv","u2",1),ev("ck","u1",1)],&q); }
-    #[test] fn ir_trends_filter() { let q=ir::Query{kind:ir::QueryKind::Trends,series:vec![ir::Series{event:ir::EventMatch::Name("pv".into()),math:ir::Math::Total}],filters:ir::PropertyGroup{op:ir::GroupOp::And,values:vec![ir::GroupOrFilter::Filter(ir::Filter{source:ir::FilterSource::Event,key:"br".into(),operator:ir::FilterOperator::Exact,value:"Ch".into()})]},..ir::Query::trends(vec![],ir::DateRange{from:None,to:None,last_n:None})}; assert_oracle(&[evp("pv","u1",1,vec![("br","Ch".into())]),evp("pv","u2",1,vec![("br","Fx".into())]),evp("pv","u3",1,vec![("br","Ch".into())])],&q); }
-    #[test] fn ir_trends_bd() { let q=ir::Query{kind:ir::QueryKind::Trends,series:vec![ir::Series{event:ir::EventMatch::Name("pv".into()),math:ir::Math::Total}],breakdown:Some(ir::Breakdown{source:ir::FilterSource::Event,key:"br".into(),limit:10}),..ir::Query::trends(vec![],ir::DateRange{from:None,to:None,last_n:None})}; assert_oracle(&[evp("pv","u1",1,vec![("br","Ch".into())]),evp("pv","u2",1,vec![("br","Fx".into())]),evp("pv","u3",1,vec![("br","Ch".into())])],&q); }
-    #[test] fn ir_trends_drange() { let q=ir::Query::trends(vec![ir::Series{event:ir::EventMatch::Name("pv".into()),math:ir::Math::Total}],ir::DateRange{from:None,to:None,last_n:Some(ir::LastN::Days(7))}); assert_oracle(&[ev("pv","u1",1),ev("pv","u2",100)],&q); }
-    #[test] fn ir_trends_empty() { let d=tempfile::tempdir().unwrap(); EventStore::open(d.path().to_path_buf()).unwrap(); let e=QueryEngine::new(d.path().to_path_buf()); let q=ir::Query::trends(vec![ir::Series{event:ir::EventMatch::Name("pv".into()),math:ir::Math::Total}],ir::DateRange{from:None,to:None,last_n:None}); assert!(e.run_ir(&q,"phc_t").unwrap().results[0].data.is_empty()); }
-    #[test] fn ir_trend_dau() { let (_d,e)=engine_with(&[ev("pv","u1",1),ev("pv","u1",2),ev("pv","u2",1)]); let q=ir::Query::trends(vec![ir::Series{event:ir::EventMatch::Name("pv".into()),math:ir::Math::Dau}],ir::DateRange{from:None,to:None,last_n:None}); let r=e.run_ir(&q,"phc_t").unwrap(); assert!(!r.results.is_empty()); }
+    #[test]
+    fn ir_trends_total() {
+        let q = ir::Query::trends(
+            vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            ir::DateRange {
+                from: None,
+                to: None,
+                last_n: None,
+            },
+        );
+        assert_oracle(
+            &[
+                ev("pv", "u1", 1),
+                ev("pv", "u1", 2),
+                ev("pv", "u2", 1),
+                ev("ck", "u1", 1),
+            ],
+            &q,
+        );
+    }
+    #[test]
+    fn ir_trends_filter() {
+        let q = ir::Query {
+            kind: ir::QueryKind::Trends,
+            series: vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            filters: ir::PropertyGroup {
+                op: ir::GroupOp::And,
+                values: vec![ir::GroupOrFilter::Filter(ir::Filter {
+                    source: ir::FilterSource::Event,
+                    key: "br".into(),
+                    operator: ir::FilterOperator::Exact,
+                    value: "Ch".into(),
+                })],
+            },
+            ..ir::Query::trends(
+                vec![],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: None,
+                },
+            )
+        };
+        assert_oracle(
+            &[
+                evp("pv", "u1", 1, vec![("br", "Ch".into())]),
+                evp("pv", "u2", 1, vec![("br", "Fx".into())]),
+                evp("pv", "u3", 1, vec![("br", "Ch".into())]),
+            ],
+            &q,
+        );
+    }
+    #[test]
+    fn ir_trends_bd() {
+        let q = ir::Query {
+            kind: ir::QueryKind::Trends,
+            series: vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            breakdown: Some(ir::Breakdown {
+                source: ir::FilterSource::Event,
+                key: "br".into(),
+                limit: 10,
+            }),
+            ..ir::Query::trends(
+                vec![],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: None,
+                },
+            )
+        };
+        assert_oracle(
+            &[
+                evp("pv", "u1", 1, vec![("br", "Ch".into())]),
+                evp("pv", "u2", 1, vec![("br", "Fx".into())]),
+                evp("pv", "u3", 1, vec![("br", "Ch".into())]),
+            ],
+            &q,
+        );
+    }
+    #[test]
+    fn breakdown_limit_uses_deterministic_top_values_for_the_whole_range() {
+        let now = Utc::now();
+        let mut events = vec![];
+        for (breakdown, count) in [("z", 3), ("a", 2), ("b", 2)] {
+            for index in 0..count {
+                events.push(evp(
+                    "pv",
+                    &format!("{breakdown}-{index}"),
+                    1,
+                    vec![("br", breakdown.into())],
+                ));
+            }
+        }
+        for index in 0..8 {
+            events.push(evp(
+                "pv",
+                &format!("old-{index}"),
+                100,
+                vec![("br", "old".into())],
+            ));
+        }
+        let (_dir, engine) = engine_with(&events);
+        let query = ir::Query {
+            kind: ir::QueryKind::Trends,
+            series: vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            breakdown: Some(ir::Breakdown {
+                source: ir::FilterSource::Event,
+                key: "br".into(),
+                limit: 2,
+            }),
+            ..ir::Query::trends(
+                vec![],
+                ir::DateRange {
+                    from: Some((now - Duration::hours(48)).to_rfc3339()),
+                    to: Some((now + Duration::hours(1)).to_rfc3339()),
+                    last_n: None,
+                },
+            )
+        };
+
+        let response = engine.run_ir(&query, "phc_t").unwrap();
+        let values = response
+            .results
+            .iter()
+            .filter_map(|series| series.breakdown_value.as_deref())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(values, std::collections::BTreeSet::from(["a", "z"]));
+    }
+    #[test]
+    fn ir_trends_drange() {
+        let q = ir::Query::trends(
+            vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            ir::DateRange {
+                from: None,
+                to: None,
+                last_n: Some(ir::LastN::Days(7)),
+            },
+        );
+        assert_oracle(&[ev("pv", "u1", 1), ev("pv", "u2", 100)], &q);
+    }
+    #[test]
+    fn ir_trends_empty() {
+        let d = tempfile::tempdir().unwrap();
+        EventStore::open(d.path().to_path_buf()).unwrap();
+        let e = QueryEngine::new(d.path().to_path_buf());
+        let q = ir::Query::trends(
+            vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            ir::DateRange {
+                from: None,
+                to: None,
+                last_n: None,
+            },
+        );
+        assert!(e.run_ir(&q, "phc_t").unwrap().results[0].data.is_empty());
+    }
+    #[test]
+    fn ir_trend_dau() {
+        let (_d, e) = engine_with(&[ev("pv", "u1", 1), ev("pv", "u1", 2), ev("pv", "u2", 1)]);
+        let q = ir::Query::trends(
+            vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Dau,
+            }],
+            ir::DateRange {
+                from: None,
+                to: None,
+                last_n: None,
+            },
+        );
+        let r = e.run_ir(&q, "phc_t").unwrap();
+        assert!(!r.results.is_empty());
+    }
+
+    #[test]
+    fn supported_query_executes_the_validated_trends_path() {
+        let (_dir, engine) = engine_with(&[ev("pv", "u1", 1), ev("pv", "u2", 1)]);
+        let raw = ir::Query::trends(
+            vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            ir::DateRange {
+                from: Some("2020-01-01T00:00:00Z".into()),
+                to: Some("2030-01-01T00:00:00Z".into()),
+                last_n: None,
+            },
+        );
+        let query = supported::SupportedQuery::try_from(raw).unwrap();
+
+        let response = engine.run_supported(&query, "phc_t").unwrap();
+
+        assert_eq!(response.meta.kind, "trends");
+        assert_eq!(response.meta.generation_id, 0);
+        assert_eq!(
+            response.results[0]
+                .data
+                .iter()
+                .map(|point| point.count)
+                .sum::<i64>(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_more_than_eight_waiting_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = Arc::new(QueryEngine::new(directory.path().to_path_buf()));
+        let active = engine.acquire().await;
+        let mut waiters = Vec::new();
+        for _ in 0..MAX_QUEUED_QUERIES {
+            let engine = engine.clone();
+            waiters.push(tokio::spawn(async move { engine.admit().await }));
+        }
+        while engine.queue_slots.available_permits() != 0 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(matches!(engine.admit().await, Err(QueryBusy)));
+
+        for waiter in waiters {
+            waiter.abort();
+        }
+        drop(active);
+    }
 
     // ── P1 IR-backed legacy parity ──
-    #[test] fn ir_backed_trend() { let evs=&[ev("pv","u1",1),ev("pv","u1",2),ev("pv","u2",5),ev("ck","u1",1)]; let (_d,e)=engine_with(evs); let h=e.trend("phc_t","pv",30).unwrap(); let i=e.trend_via_ir("phc_t","pv",30).unwrap(); assert_eq!(h.len(),i.len()); for(a,b)in h.iter().zip(i.iter()){assert_eq!(a.day,b.day);assert_eq!(a.count,b.count);} }
-    #[test] fn ir_backed_stats() { let evs=&[ev("pv","u1",1),ev("pv","u2",2),ev("ck","u1",1),ev("ck","u3",100)]; let (_d,e)=engine_with(evs); let h=e.stats("phc_t").unwrap(); let i=e.stats_via_ir("phc_t").unwrap(); assert_eq!(h.total_events,i.total_events); assert_eq!(h.unique_persons,i.unique_persons); assert!((h.events_24h-i.events_24h).abs()<=1); }
+    #[test]
+    fn ir_backed_trend() {
+        let evs = &[
+            ev("pv", "u1", 1),
+            ev("pv", "u1", 2),
+            ev("pv", "u2", 5),
+            ev("ck", "u1", 1),
+        ];
+        let (_d, e) = engine_with(evs);
+        let h = e.trend("phc_t", "pv", 30).unwrap();
+        let i = e.trend_via_ir("phc_t", "pv", 30).unwrap();
+        assert_eq!(h.len(), i.len());
+        for (a, b) in h.iter().zip(i.iter()) {
+            assert_eq!(a.day, b.day);
+            assert_eq!(a.count, b.count);
+        }
+    }
+    #[test]
+    fn ir_backed_stats() {
+        let evs = &[
+            ev("pv", "u1", 1),
+            ev("pv", "u2", 2),
+            ev("ck", "u1", 1),
+            ev("ck", "u3", 100),
+        ];
+        let (_d, e) = engine_with(evs);
+        let h = e.stats("phc_t").unwrap();
+        let i = e.stats_via_ir("phc_t").unwrap();
+        assert_eq!(h.total_events, i.total_events);
+        assert_eq!(h.unique_persons, i.unique_persons);
+        assert!((h.events_24h - i.events_24h).abs() <= 1);
+    }
 
     // ── P3 funnel + retention tests ──
-    #[test] fn ir_funnels_matches_handwritten() { let evs=&[ev("s","u1",5),ev("a","u1",4),ev("p","u1",3),ev("s","u2",5),ev("a","u2",4),ev("s","u3",5)]; let (_d,e)=engine_with(evs); let h=e.funnel("phc_t",&["s".into(),"a".into(),"p".into()]).unwrap(); let q=ir::Query{kind:ir::QueryKind::Funnels,series:vec![ir::Series{event:ir::EventMatch::Name("s".into()),math:ir::Math::Total},ir::Series{event:ir::EventMatch::Name("a".into()),math:ir::Math::Total},ir::Series{event:ir::EventMatch::Name("p".into()),math:ir::Math::Total}],funnel_config:Some(ir::FunnelConfig{order_type:ir::FunnelOrder::Ordered,conversion_window_seconds:None,exclusions:vec![],attribution:ir::FunnelAttribution::AllSteps}),..ir::Query::trends(vec![],ir::DateRange{from:None,to:None,last_n:None})}; let r=e.run_ir(&q,"phc_t").unwrap(); assert_eq!(r.results.len(),3); assert_eq!(r.results[0].data[0].count,h[0].reached); assert_eq!(r.results[1].data[0].count,h[1].reached); assert_eq!(r.results[2].data[0].count,h[2].reached); }
-    #[test] fn ir_retention_matrix() { let evs=&[ev("s","u1",5),ev("l","u1",5),ev("l","u1",7),ev("s","u2",6),ev("l","u2",6),ev("s","u3",6)]; let (_d,e)=engine_with(evs); let q=ir::Query{kind:ir::QueryKind::Retention,retention_config:Some(ir::RetentionConfig{cohort_event:ir::EventMatch::Name("s".into()),retention_event:ir::EventMatch::Name("l".into()),..Default::default()}),..ir::Query::trends(vec![],ir::DateRange{from:None,to:None,last_n:None})}; assert!(e.run_ir(&q,"phc_t").unwrap().results.len()>=1); }
+    #[test]
+    fn ir_funnels_matches_handwritten() {
+        let evs = &[
+            ev("s", "u1", 5),
+            ev("a", "u1", 4),
+            ev("p", "u1", 3),
+            ev("s", "u2", 5),
+            ev("a", "u2", 4),
+            ev("s", "u3", 5),
+        ];
+        let (_d, e) = engine_with(evs);
+        let h = e
+            .funnel("phc_t", &["s".into(), "a".into(), "p".into()])
+            .unwrap();
+        let q = ir::Query {
+            kind: ir::QueryKind::Funnels,
+            series: vec![
+                ir::Series {
+                    event: ir::EventMatch::Name("s".into()),
+                    math: ir::Math::Total,
+                },
+                ir::Series {
+                    event: ir::EventMatch::Name("a".into()),
+                    math: ir::Math::Total,
+                },
+                ir::Series {
+                    event: ir::EventMatch::Name("p".into()),
+                    math: ir::Math::Total,
+                },
+            ],
+            funnel_config: Some(ir::FunnelConfig {
+                order_type: ir::FunnelOrder::Ordered,
+                conversion_window_seconds: None,
+                exclusions: vec![],
+                attribution: ir::FunnelAttribution::AllSteps,
+            }),
+            ..ir::Query::trends(
+                vec![],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: None,
+                },
+            )
+        };
+        let r = e.run_ir(&q, "phc_t").unwrap();
+        assert_eq!(r.results.len(), 3);
+        assert_eq!(r.results[0].data[0].count, h[0].reached);
+        assert_eq!(r.results[1].data[0].count, h[1].reached);
+        assert_eq!(r.results[2].data[0].count, h[2].reached);
+    }
+    #[test]
+    fn ir_retention_matrix() {
+        let evs = &[
+            ev("s", "u1", 5),
+            ev("l", "u1", 5),
+            ev("l", "u1", 7),
+            ev("s", "u2", 6),
+            ev("l", "u2", 6),
+            ev("s", "u3", 6),
+        ];
+        let (_d, e) = engine_with(evs);
+        let q = ir::Query {
+            kind: ir::QueryKind::Retention,
+            retention_config: Some(ir::RetentionConfig {
+                cohort_event: ir::EventMatch::Name("s".into()),
+                retention_event: ir::EventMatch::Name("l".into()),
+                ..Default::default()
+            }),
+            ..ir::Query::trends(
+                vec![],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: None,
+                },
+            )
+        };
+        assert!(e.run_ir(&q, "phc_t").unwrap().results.len() >= 1);
+    }
 
     // ── P0 oracle agreement ──
-    fn varied() -> Vec<CapturedEvent> { let n=["s","a","p","pv","ck"]; let mut evs=vec![]; for i in 0..400usize{let u=i%37;let mut e=ev(n[(i*7)%n.len()],&format!("u{u}"),(i%50)as i64);e.uuid=Uuid::from_u128((i%380)as u128);evs.push(e);} evs }
-    #[test] fn oracle_agrees() { let evs=varied(); let (_d,e)=engine_with(&evs); let s=e.stats("phc_t").unwrap(); let (ot,op)=oracle::total_and_persons(&evs,"phc_t"); assert_eq!(s.total_events,ot); assert_eq!(s.unique_persons,op); let st:std::collections::HashMap<String,i64>=e.top_events("phc_t",100).unwrap().into_iter().map(|x|(x.event,x.count)).collect(); assert_eq!(st,oracle::top_events(&evs,"phc_t")); for steps in [vec!["s".into(),"a".into(),"p".into()],vec!["pv".into(),"ck".into()],vec!["ck".into(),"s".into(),"a".into()]] { let sq:Vec<i64>=e.funnel("phc_t",&steps).unwrap().into_iter().map(|s|s.reached).collect(); assert_eq!(sq,oracle::funnel(&evs,"phc_t",&steps)); } }
+    fn varied() -> Vec<CapturedEvent> {
+        let n = ["s", "a", "p", "pv", "ck"];
+        let mut evs = vec![];
+        for i in 0..400usize {
+            let u = i % 37;
+            let mut e = ev(n[(i * 7) % n.len()], &format!("u{u}"), (i % 50) as i64);
+            e.uuid = Uuid::from_u128((i % 380) as u128);
+            evs.push(e);
+        }
+        evs
+    }
+    #[test]
+    fn oracle_agrees() {
+        let evs = varied();
+        let (_d, e) = engine_with(&evs);
+        let s = e.stats("phc_t").unwrap();
+        let (ot, op) = oracle::total_and_persons(&evs, "phc_t");
+        assert_eq!(s.total_events, ot);
+        assert_eq!(s.unique_persons, op);
+        let st: std::collections::HashMap<String, i64> = e
+            .top_events("phc_t", 100)
+            .unwrap()
+            .into_iter()
+            .map(|x| (x.event, x.count))
+            .collect();
+        assert_eq!(st, oracle::top_events(&evs, "phc_t"));
+        for steps in [
+            vec!["s".into(), "a".into(), "p".into()],
+            vec!["pv".into(), "ck".into()],
+            vec!["ck".into(), "s".into(), "a".into()],
+        ] {
+            let sq: Vec<i64> = e
+                .funnel("phc_t", &steps)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.reached)
+                .collect();
+            assert_eq!(sq, oracle::funnel(&evs, "phc_t", &steps));
+        }
+    }
 
     /// A store written before partitioning must keep answering after the
     /// upgrade — no migration step, no silently missing history. Mixed layouts
@@ -434,10 +1787,21 @@ mod tests {
 
         // And through the IR path, which prunes.
         let q = ir::Query::trends(
-            vec![ir::Series { event: ir::EventMatch::Name("pv".into()), math: ir::Math::Total }],
-            ir::DateRange { from: None, to: None, last_n: None },
+            vec![ir::Series {
+                event: ir::EventMatch::Name("pv".into()),
+                math: ir::Math::Total,
+            }],
+            ir::DateRange {
+                from: None,
+                to: None,
+                last_n: None,
+            },
         );
-        let total: i64 = engine.run_ir(&q, "phc_t").unwrap().results[0].data.iter().map(|d| d.count).sum();
+        let total: i64 = engine.run_ir(&q, "phc_t").unwrap().results[0]
+            .data
+            .iter()
+            .map(|d| d.count)
+            .sum();
         assert_eq!(total, 2, "pruned query lost a layout");
     }
 
@@ -448,8 +1812,15 @@ mod tests {
         let (_d, e) = engine_with(&evs);
         for days in [1i64, 7, 90, 3650] {
             let q = ir::Query::trends(
-                vec![ir::Series { event: ir::EventMatch::Name("pv".into()), math: ir::Math::Total }],
-                ir::DateRange { from: None, to: None, last_n: Some(ir::LastN::Days(days as u32)) },
+                vec![ir::Series {
+                    event: ir::EventMatch::Name("pv".into()),
+                    math: ir::Math::Total,
+                }],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: Some(ir::LastN::Days(days as u32)),
+                },
             );
             // Whatever the window, every row returned must fall inside it.
             let r = e.run_ir(&q, "phc_t").unwrap();
@@ -457,7 +1828,6 @@ mod tests {
             let _ = r.results;
         }
     }
-
 
     /// The engine must actually hand DuckDB a narrower file list for a narrower
     /// window. At demo scale the wall-clock difference is noise, so assert on
@@ -484,8 +1854,15 @@ mod tests {
 
         let files_for_window = |days: u32| {
             let q = ir::Query::trends(
-                vec![ir::Series { event: ir::EventMatch::Name("pv".into()), math: ir::Math::Total }],
-                ir::DateRange { from: None, to: None, last_n: Some(ir::LastN::Days(days)) },
+                vec![ir::Series {
+                    event: ir::EventMatch::Name("pv".into()),
+                    math: ir::Math::Total,
+                }],
+                ir::DateRange {
+                    from: None,
+                    to: None,
+                    last_n: Some(ir::LastN::Days(days)),
+                },
             );
             engine.source_for(&q, "phc_t").matches(".parquet").count()
         };
@@ -493,8 +1870,13 @@ mod tests {
         let week = files_for_window(7);
         let all = files_for_window(3650);
         assert_eq!(all, 60, "wide window should see every partition");
-        assert!(week < all, "narrow window opened {week} files, wide opened {all} — no pruning");
-        assert!(week <= 10, "7-day window opened {week} files; expected ~8 with slack");
+        assert!(
+            week < all,
+            "narrow window opened {week} files, wide opened {all} — no pruning"
+        );
+        assert!(
+            week <= 10,
+            "7-day window opened {week} files; expected ~8 with slack"
+        );
     }
-
 }

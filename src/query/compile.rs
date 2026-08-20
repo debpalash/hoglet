@@ -55,11 +55,11 @@ pub fn compile(
     source: &str,
     _identity_db_path: Option<&str>,
 ) -> Result<CompiledQuery, CompileError> {
-    query
-        .validate()
-        .map_err(|e| CompileError::Validation(match e {
+    query.validate().map_err(|e| {
+        CompileError::Validation(match e {
             IrError::Invalid(msg) => msg,
-        }))?;
+        })
+    })?;
 
     match query.kind {
         QueryKind::Trends => compile_trends(query, token, source),
@@ -87,8 +87,9 @@ pub fn glob_source(glob: &str) -> String {
 /// these and nothing else, which is what makes partition pruning real rather
 /// than advisory (`spec/scale.md` §1).
 ///
-/// An empty list has no valid SQL spelling, so callers must fall back to a glob;
-/// `QueryEngine::has_data` already gates that case.
+/// An empty list has no valid SQL spelling, so callers must return an empty
+/// result before compiling. Production project queries must never turn an
+/// empty scoped generation into a whole-store glob.
 pub fn file_list_source(files: &[std::path::PathBuf]) -> String {
     let quoted: Vec<String> = files
         .iter()
@@ -105,26 +106,26 @@ pub fn file_list_source(files: &[std::path::PathBuf]) -> String {
 /// Scoped by the same filters and date range as the insight it came from, so
 /// the row count here reconciles with the cell that was clicked. `day` narrows
 /// to a single interval bucket (the clicked column); empty means the whole range.
-fn compile_actors(
-    query: &Query,
-    token: &str,
-    source: &str,
-) -> Result<CompiledQuery, CompileError> {
+fn compile_actors(query: &Query, token: &str, source: &str) -> Result<CompiledQuery, CompileError> {
     let cfg = query
         .actors_config
         .as_ref()
-        .ok_or(CompileError::Validation("actors_config is required for Actors queries"))?;
+        .ok_or(CompileError::Validation(
+            "actors_config is required for Actors queries",
+        ))?;
     let series = query
         .series
         .get(cfg.series_index)
-        .ok_or(CompileError::Validation("actors_config.series_index is out of range"))?;
+        .ok_or(CompileError::Validation(
+            "actors_config.series_index is out of range",
+        ))?;
 
     let mut params: Vec<ParamValue> = Vec::new();
     params.push(ParamValue::Text(token.to_string()));
     let mut sql = format!(
         "WITH deduped AS (\n\
          \x20   SELECT * FROM read_parquet({source})\n\
-         \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
+         \x20   QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
          \x20   SELECT * FROM deduped WHERE token = $1\n\
@@ -182,11 +183,7 @@ fn compile_actors(
 
 // ── Trends compilation ────────────────────────────────────────────
 
-fn compile_trends(
-    query: &Query,
-    token: &str,
-    source: &str,
-) -> Result<CompiledQuery, CompileError> {
+fn compile_trends(query: &Query, token: &str, source: &str) -> Result<CompiledQuery, CompileError> {
     let interval_expr = interval_sql(query.interval);
     let mut params: Vec<ParamValue> = Vec::new();
 
@@ -195,7 +192,7 @@ fn compile_trends(
     let mut sql = format!(
         "WITH deduped AS (\n\
          \x20   SELECT * FROM read_parquet({source})\n\
-         \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
+         \x20   QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
          \x20   SELECT * FROM deduped WHERE token = $1\n\
@@ -233,31 +230,66 @@ fn compile_trends(
         let col = if filter.is_empty() {
             format!("{label} AS label_{i}, {agg} AS count_{i}")
         } else {
-            format!(
-                "{label} AS label_{i}, {agg} FILTER ({filter}) AS count_{i}"
-            )
+            format!("{label} AS label_{i}, {agg} FILTER ({filter}) AS count_{i}")
         };
         series_selects.push(col);
     }
 
-    // Breakdown: additional GROUP BY column
-    let (breakdown_select, breakdown_group) = match &query.breakdown {
-        Some(b) => {
-            let col = property_column(&b.key, &b.source);
-            (format!(", {col} AS breakdown_value"), format!(", {col}"))
-        }
-        None => (String::new(), String::new()),
-    };
+    let selects = series_selects.join(",\n       ");
+    match &query.breakdown {
+        Some(breakdown) => {
+            let column = property_column(&breakdown.key, &breakdown.source);
+            let series_filter = compile_series_match(&query.series);
+            let ranking_where = if series_filter.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {series_filter}")
+            };
 
-    sql.push_str(&format!(
-        "SELECT {interval_expr} AS interval{breakdown_select},\n\
-         \x20      {selects}\n\
-         FROM e\n\
-         {where_clause}\n\
-         GROUP BY interval{breakdown_group}\n\
-         ORDER BY interval",
-        selects = series_selects.join(",\n       "),
-    ));
+            // Rank breakdown values once across the complete selected range,
+            // not once per interval bucket. The value tie-breaker makes the
+            // chosen top N stable across files and DuckDB execution plans.
+            sql.push_str(&format!(
+                ",\n\
+                 filtered AS (\n\
+                 \x20   SELECT * FROM e\n\
+                 \x20   {where_clause}\n\
+                 ),\n\
+                 top_breakdowns AS (\n\
+                 \x20   SELECT {column} AS breakdown_value\n\
+                 \x20   FROM filtered e\n\
+                 \x20   {ranking_where}\n\
+                 \x20   GROUP BY 1\n\
+                 \x20   ORDER BY count(*) DESC, breakdown_value ASC NULLS LAST\n\
+                 \x20   LIMIT {limit}\n\
+                 )\n\
+                 SELECT {interval_expr} AS interval, {column} AS breakdown_value,\n\
+                 \x20      {selects}\n\
+                 FROM filtered e\n\
+                 JOIN top_breakdowns top\n\
+                 \x20 ON {column} IS NOT DISTINCT FROM top.breakdown_value\n\
+                 GROUP BY 1, 2\n\
+                 ORDER BY interval, breakdown_value ASC NULLS LAST\n\
+                 LIMIT {max_rows}",
+                limit = breakdown
+                    .limit
+                    .clamp(1, crate::query::supported::MAX_BREAKDOWN_LIMIT),
+                max_rows = crate::query::MAX_QUERY_RESULT_ROWS,
+            ));
+        }
+        None => {
+            sql.push_str(&format!(
+                "SELECT {interval_expr} AS interval,\n\
+                 \x20      {selects}\n\
+                 FROM e\n\
+                 {where_clause}\n\
+                 GROUP BY interval\n\
+                 ORDER BY interval\n\
+                 LIMIT {max_rows}",
+                max_rows = crate::query::MAX_QUERY_RESULT_ROWS,
+            ));
+        }
+    }
 
     Ok(CompiledQuery { sql, params })
 }
@@ -268,7 +300,9 @@ fn compile_funnels(
     source: &str,
 ) -> Result<CompiledQuery, CompileError> {
     if query.series.is_empty() {
-        return Err(CompileError::Validation("funnels requires at least one step"));
+        return Err(CompileError::Validation(
+            "funnels requires at least one step",
+        ));
     }
     if query.series.len() > 12 {
         return Err(CompileError::Validation("funnels max 12 steps"));
@@ -293,7 +327,7 @@ fn compile_funnels(
     let mut sql = format!(
         "WITH deduped AS (\n\
          \x20   SELECT * FROM read_parquet({source})\n\
-         \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
+         \x20   QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
          \x20   SELECT * FROM deduped WHERE token = $P\n\
@@ -377,11 +411,18 @@ fn compile_funnels(
             let step_conditions: Vec<String> = steps
                 .iter()
                 .enumerate()
-                .map(|(_i, s)| format!("sum(CASE WHEN e.event = '{}' THEN 1 ELSE 0 END) > 0", s.replace('\'', "''")))
+                .map(|(_i, s)| {
+                    format!(
+                        "sum(CASE WHEN e.event = '{}' THEN 1 ELSE 0 END) > 0",
+                        s.replace('\'', "''")
+                    )
+                })
                 .collect();
 
             let window_clause = window
-                .map(|w| format!("HAVING max(e.timestamp) - min(e.timestamp) <= INTERVAL {w} SECONDS"))
+                .map(|w| {
+                    format!("HAVING max(e.timestamp) - min(e.timestamp) <= INTERVAL {w} SECONDS")
+                })
                 .unwrap_or_default();
 
             sql.push_str(&format!(
@@ -389,7 +430,11 @@ fn compile_funnels(
                  FROM (SELECT e.distinct_id FROM e \
                  WHERE {} GROUP BY e.distinct_id {} \
                  HAVING {})",
-                if filter_sql.is_empty() { "1=1".to_string() } else { filter_sql.clone() },
+                if filter_sql.is_empty() {
+                    "1=1".to_string()
+                } else {
+                    filter_sql.clone()
+                },
                 window_clause,
                 step_conditions.join(" AND ")
             ));
@@ -399,11 +444,7 @@ fn compile_funnels(
     Ok(CompiledQuery { sql, params })
 }
 
-fn compile_sql(
-    query: &Query,
-    token: &str,
-    source: &str,
-) -> Result<CompiledQuery, CompileError> {
+fn compile_sql(query: &Query, token: &str, source: &str) -> Result<CompiledQuery, CompileError> {
     let config = query
         .sql_config
         .as_ref()
@@ -424,12 +465,15 @@ fn compile_sql(
         "WITH events AS (\n\
          \x20   SELECT * FROM read_parquet({source})\n\
          \x20   WHERE token = '{escaped_token}'\n\
-         \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
+         \x20   QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1\n\
          )\n\
          {user_sql}"
     );
 
-    Ok(CompiledQuery { sql, params: vec![] })
+    Ok(CompiledQuery {
+        sql,
+        params: vec![],
+    })
 }
 
 fn compile_retention(
@@ -440,15 +484,25 @@ fn compile_retention(
     let config = query
         .retention_config
         .as_ref()
-        .ok_or(CompileError::Validation("retention requires retention_config"))?;
+        .ok_or(CompileError::Validation(
+            "retention requires retention_config",
+        ))?;
 
     let cohort_event = match &config.cohort_event {
         EventMatch::Name(n) => n.clone(),
-        EventMatch::Any => return Err(CompileError::Validation("retention cohort event must be a named event")),
+        EventMatch::Any => {
+            return Err(CompileError::Validation(
+                "retention cohort event must be a named event",
+            ));
+        }
     };
     let retention_event = match &config.retention_event {
         EventMatch::Name(n) => n.clone(),
-        EventMatch::Any => return Err(CompileError::Validation("retention event must be a named event")),
+        EventMatch::Any => {
+            return Err(CompileError::Validation(
+                "retention event must be a named event",
+            ));
+        }
     };
 
     let period_unit = match config.period {
@@ -464,7 +518,7 @@ fn compile_retention(
     let sql = format!(
         "WITH deduped AS (\n\
          \x20   SELECT * FROM read_parquet({source})\n\
-         \x20   QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1\n\
+         \x20   QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1\n\
          ),\n\
          e AS (\n\
          \x20   SELECT * FROM deduped WHERE token = $P\n\
@@ -498,15 +552,26 @@ fn compile_lifecycle(
     token: &str,
     source: &str,
 ) -> Result<CompiledQuery, CompileError> {
-    let config = query.lifecycle_config.as_ref()
-        .ok_or(CompileError::Validation("lifecycle requires lifecycle_config"))?;
-    let event = match &config.event { EventMatch::Name(n) => n.clone(), _ => return Err(CompileError::Validation("lifecycle event must be named")) };
-    let period = match config.prior_period { LifecyclePeriod::Day => "DAY", LifecyclePeriod::Week => "WEEK", LifecyclePeriod::Month => "MONTH" };
+    let config = query
+        .lifecycle_config
+        .as_ref()
+        .ok_or(CompileError::Validation(
+            "lifecycle requires lifecycle_config",
+        ))?;
+    let event = match &config.event {
+        EventMatch::Name(n) => n.clone(),
+        _ => return Err(CompileError::Validation("lifecycle event must be named")),
+    };
+    let period = match config.prior_period {
+        LifecyclePeriod::Day => "DAY",
+        LifecyclePeriod::Week => "WEEK",
+        LifecyclePeriod::Month => "MONTH",
+    };
 
     let params = vec![ParamValue::Text(token.to_string())];
 
     let sql = format!(
-        "WITH deduped AS (SELECT * FROM read_parquet({source}) QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1),
+        "WITH deduped AS (SELECT * FROM read_parquet({source}) QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1),
          e AS (SELECT * FROM deduped WHERE token = $P),
          current AS (
             SELECT distinct_id, date_trunc('{period}', timestamp) AS period
@@ -542,15 +607,22 @@ fn compile_stickiness(
     token: &str,
     source: &str,
 ) -> Result<CompiledQuery, CompileError> {
-    let config = query.stickiness_config.as_ref()
-        .ok_or(CompileError::Validation("stickiness requires stickiness_config"))?;
-    let event = match &config.event { EventMatch::Name(n) => n.clone(), _ => return Err(CompileError::Validation("stickiness event must be named")) };
+    let config = query
+        .stickiness_config
+        .as_ref()
+        .ok_or(CompileError::Validation(
+            "stickiness requires stickiness_config",
+        ))?;
+    let event = match &config.event {
+        EventMatch::Name(n) => n.clone(),
+        _ => return Err(CompileError::Validation("stickiness event must be named")),
+    };
     let window_days = config.window_days.min(90);
 
     let params = vec![ParamValue::Text(token.to_string())];
 
     let sql = format!(
-        "WITH deduped AS (SELECT * FROM read_parquet({source}) QUALIFY row_number() OVER (PARTITION BY uuid ORDER BY timestamp) = 1),
+        "WITH deduped AS (SELECT * FROM read_parquet({source}) QUALIFY row_number() OVER (PARTITION BY token, uuid ORDER BY timestamp) = 1),
          e AS (SELECT * FROM deduped WHERE token = $P),
          user_counts AS (
             SELECT distinct_id, count(*) AS event_count
@@ -570,12 +642,10 @@ fn compile_stickiness(
 
 // ── Math compilation ──────────────────────────────────────────────
 
-fn compile_math(
-    math: &Math,
-    params: &mut Vec<ParamValue>,
-) -> Result<String, CompileError> {
+fn compile_math(math: &Math, params: &mut Vec<ParamValue>) -> Result<String, CompileError> {
     match math {
         Math::Total => Ok("count(*)".to_string()),
+        Math::UniquePersons => Ok("count(DISTINCT e.distinct_id)".to_string()),
         Math::Dau => Ok("count(DISTINCT e.distinct_id)".to_string()),
         Math::Wau => Ok("count(DISTINCT e.distinct_id)".to_string()),
         Math::Mau => Ok("count(DISTINCT e.distinct_id)".to_string()),
@@ -653,6 +723,30 @@ fn compile_event_match(event: &EventMatch, _params: &mut Vec<ParamValue>) -> Str
     }
 }
 
+fn compile_series_match(series: &[Series]) -> String {
+    if series
+        .iter()
+        .any(|item| matches!(&item.event, EventMatch::Any))
+    {
+        return String::new();
+    }
+
+    let mut names = series
+        .iter()
+        .filter_map(|item| match &item.event {
+            EventMatch::Name(name) => Some(sql_string(name)),
+            EventMatch::Any => None,
+        })
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("e.event IN ({})", names.join(", "))
+    }
+}
+
 // ── PropertyGroup → SQL ───────────────────────────────────────────
 
 fn compile_property_group(
@@ -698,16 +792,22 @@ fn compile_filter(
     let col = match filter.source {
         FilterSource::Event => {
             // Access event property from the JSON properties column.
-            let path = filter.key.replace('\'', "''");
-            // DuckDB: json_extract returns the value; json_extract_string casts to string
-            format!("json_extract_string({table_alias}.properties, '$.{path}')")
+            format!(
+                "json_extract_string({table_alias}.properties, {})",
+                json_pointer_literal(&filter.key)
+            )
         }
         FilterSource::Person => {
             return Ok(("1=1 /* person-filter stub */".to_string(), vec![]));
         }
         FilterSource::Cohort => {
             let cohort_id = filter.value.as_str().unwrap_or("");
-            return Ok((format!("{table_alias}.distinct_id IN (SELECT distinct_id FROM cohort_members WHERE cohort_id = $P)"), vec![ParamValue::Text(cohort_id.to_string())]));
+            return Ok((
+                format!(
+                    "{table_alias}.distinct_id IN (SELECT distinct_id FROM cohort_members WHERE cohort_id = $P)"
+                ),
+                vec![ParamValue::Text(cohort_id.to_string())],
+            ));
         }
     };
 
@@ -863,15 +963,28 @@ fn interval_sql(interval: Interval) -> &'static str {
 // ── Helpers ───────────────────────────────────────────────────────
 
 fn property_column(key: &str, source: &FilterSource) -> String {
-    let escaped_key = key.replace('\'', "''");
     match source {
         FilterSource::Event => {
-            format!("json_extract_string(e.properties, '$.{escaped_key}')")
+            format!(
+                "json_extract_string(e.properties, {})",
+                json_pointer_literal(key)
+            )
         }
         FilterSource::Person | FilterSource::Cohort => {
-            format!("json_extract_string(p.properties, '$.{escaped_key}')")
+            format!(
+                "json_extract_string(p.properties, {})",
+                json_pointer_literal(key)
+            )
         }
     }
+}
+
+/// Encode an object key as one RFC 6901 JSON Pointer token, then quote it as a
+/// SQL string literal. Dots, brackets, quotes, slashes and tildes remain data;
+/// none of them can change either the JSON lookup or the surrounding SQL.
+fn json_pointer_literal(key: &str) -> String {
+    let token = key.replace('~', "~0").replace('/', "~1");
+    sql_string(&format!("/{token}"))
 }
 
 pub fn series_label(series: &Series, index: usize) -> String {
@@ -890,6 +1003,7 @@ pub fn series_label(series: &Series, index: usize) -> String {
 fn math_label(math: &Math) -> &'static str {
     match math {
         Math::Total => "Total",
+        Math::UniquePersons => "Unique persons",
         Math::Dau => "DAU",
         Math::Wau => "WAU",
         Math::Mau => "MAU",
@@ -962,18 +1076,30 @@ mod tests {
     const GLOB: &str = "events/*.parquet";
 
     /// Call sites pass a source expression, not a raw glob.
-    fn src() -> String { glob_source(GLOB) }
+    fn src() -> String {
+        glob_source(GLOB)
+    }
 
     fn series(name: &str) -> Series {
-        Series { event: EventMatch::Name(name.into()), math: Math::Total }
+        Series {
+            event: EventMatch::Name(name.into()),
+            math: Math::Total,
+        }
     }
 
     fn open_range() -> DateRange {
-        DateRange { from: None, to: None, last_n: None }
+        DateRange {
+            from: None,
+            to: None,
+            last_n: None,
+        }
     }
 
     fn q(kind: QueryKind) -> Query {
-        Query { kind, ..Query::trends(vec![series("pageview")], open_range()) }
+        Query {
+            kind,
+            ..Query::trends(vec![series("pageview")], open_range())
+        }
     }
 
     fn texts(c: &CompiledQuery) -> Vec<String> {
@@ -1002,7 +1128,7 @@ mod tests {
         ];
         for kind in kinds {
             let label = format!("{kind:?}");
-            let mut query = q(kind);
+            let mut query = q(kind.clone());
             query.funnel_config = Some(FunnelConfig {
                 order_type: FunnelOrder::default(),
                 conversion_window_seconds: None,
@@ -1028,7 +1154,9 @@ mod tests {
                 event: EventMatch::Name("pageview".into()),
                 window_days: 30,
             });
-            query.sql_config = Some(SqlConfig { sql: "SELECT 1".into() });
+            query.sql_config = Some(SqlConfig {
+                sql: "SELECT 1".into(),
+            });
             let compiled = compile(&query, "phc_t", &src(), None)
                 .unwrap_or_else(|e| panic!("{label} failed to compile: {e}"));
             assert!(!compiled.sql.is_empty(), "{label} compiled to empty SQL");
@@ -1057,15 +1185,128 @@ mod tests {
             "filter value leaked into SQL text: {}",
             compiled.sql
         );
-        assert!(texts(&compiled).iter().any(|p| p == nasty), "value was not bound");
+        assert!(
+            texts(&compiled).iter().any(|p| p == nasty),
+            "value was not bound"
+        );
     }
 
     /// Same promise for the token, which arrives from an HTTP query string.
     #[test]
     fn token_is_bound_not_interpolated() {
         let compiled = compile(&q(QueryKind::Trends), "phc_'; --", GLOB, None).unwrap();
-        assert!(!compiled.sql.contains("phc_'; --"), "token leaked into SQL text");
+        assert!(
+            !compiled.sql.contains("phc_'; --"),
+            "token leaked into SQL text"
+        );
         assert!(texts(&compiled).iter().any(|p| p == "phc_'; --"));
+    }
+
+    #[test]
+    fn deduplication_is_scoped_by_token_and_uuid() {
+        for kind in [
+            QueryKind::Trends,
+            QueryKind::Funnels,
+            QueryKind::Retention,
+            QueryKind::Lifecycle,
+            QueryKind::Stickiness,
+            QueryKind::Sql,
+            QueryKind::Actors,
+        ] {
+            let mut query = q(kind.clone());
+            query.funnel_config = Some(FunnelConfig {
+                order_type: FunnelOrder::default(),
+                conversion_window_seconds: None,
+                exclusions: vec![],
+                attribution: FunnelAttribution::default(),
+            });
+            query.retention_config = Some(RetentionConfig {
+                cohort_event: EventMatch::Name("signup".into()),
+                retention_event: EventMatch::Name("pageview".into()),
+                ..RetentionConfig::default()
+            });
+            query.lifecycle_config = Some(LifecycleConfig {
+                event: EventMatch::Name("pageview".into()),
+                prior_period: LifecyclePeriod::default(),
+            });
+            query.stickiness_config = Some(StickinessConfig {
+                event: EventMatch::Name("pageview".into()),
+                window_days: 30,
+            });
+            query.sql_config = Some(SqlConfig {
+                sql: "SELECT 1".into(),
+            });
+            query.actors_config = Some(ActorsConfig {
+                series_index: 0,
+                day: String::new(),
+                offset: 0,
+                limit: 10,
+            });
+
+            let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+            assert!(
+                compiled.sql.contains("PARTITION BY token, uuid"),
+                "{kind:?} deduplicated across projects: {}",
+                compiled.sql
+            );
+        }
+    }
+
+    #[test]
+    fn property_keys_are_encoded_as_single_json_pointer_tokens() {
+        let key = "flat.key[0]/til~de' OR true --";
+        let mut query = q(QueryKind::Trends);
+        query.filters.values.push(GroupOrFilter::Filter(Filter {
+            source: FilterSource::Event,
+            key: key.into(),
+            operator: FilterOperator::Exact,
+            value: serde_json::json!("yes"),
+        }));
+        query.breakdown = Some(Breakdown {
+            source: FilterSource::Event,
+            key: key.into(),
+            limit: 3,
+        });
+
+        let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+
+        assert!(
+            compiled
+                .sql
+                .contains("'/flat.key[0]~1til~0de'' OR true --'")
+        );
+        assert!(!compiled.sql.contains("$.flat.key"));
+    }
+
+    #[test]
+    fn breakdown_limit_is_ranked_once_across_the_selected_range() {
+        let mut query = q(QueryKind::Trends);
+        query.breakdown = Some(Breakdown {
+            source: FilterSource::Event,
+            key: "browser".into(),
+            limit: 7,
+        });
+        query.range = DateRange {
+            from: Some("2026-08-01T00:00:00Z".into()),
+            to: Some("2026-08-02T00:00:00Z".into()),
+            last_n: None,
+        };
+
+        let compiled = compile(&query, "phc_t", &src(), None).unwrap();
+
+        assert_eq!(compiled.sql.matches("top_breakdowns AS").count(), 1);
+        assert!(compiled.sql.contains("FROM filtered e"));
+        assert!(
+            compiled
+                .sql
+                .contains("ORDER BY count(*) DESC, breakdown_value ASC NULLS LAST")
+        );
+        assert!(compiled.sql.contains("LIMIT 7"));
+        assert!(
+            compiled
+                .sql
+                .ends_with(&format!("LIMIT {}", crate::query::MAX_QUERY_RESULT_ROWS))
+        );
     }
 
     /// A drill-down feeds a person list to the browser, so its limit is a real
@@ -1080,11 +1321,19 @@ mod tests {
             limit: 100_000,
         });
         let compiled = compile(&query, "phc_t", &src(), None).unwrap();
-        assert!(compiled.sql.contains("LIMIT 1000"), "limit not clamped: {}", compiled.sql);
+        assert!(
+            compiled.sql.contains("LIMIT 1000"),
+            "limit not clamped: {}",
+            compiled.sql
+        );
 
         query.actors_config.as_mut().unwrap().limit = 0;
         let compiled = compile(&query, "phc_t", &src(), None).unwrap();
-        assert!(compiled.sql.contains("LIMIT 1"), "zero limit not raised: {}", compiled.sql);
+        assert!(
+            compiled.sql.contains("LIMIT 1"),
+            "zero limit not raised: {}",
+            compiled.sql
+        );
     }
 
     /// Out-of-range drill-down must fail loudly. Silently compiling against
@@ -1122,8 +1371,14 @@ mod tests {
             limit: 10,
         });
         let compiled = compile(&query, "phc_t", &src(), None).unwrap();
-        assert!(texts(&compiled).iter().any(|p| p == "2026-08-04"), "day not bound");
-        assert!(!compiled.sql.contains("2026-08-04"), "day interpolated into SQL");
+        assert!(
+            texts(&compiled).iter().any(|p| p == "2026-08-04"),
+            "day not bound"
+        );
+        assert!(
+            !compiled.sql.contains("2026-08-04"),
+            "day interpolated into SQL"
+        );
     }
 
     /// IR validation runs before compilation, so a malformed query never
@@ -1158,8 +1413,17 @@ mod tests {
         ]);
         assert_eq!(list, "['a/1.parquet', 'b''/2.parquet']");
 
-        let compiled = compile(&q(QueryKind::Trends), "phc_t", &glob_source("ev'ents/*.parquet"), None).unwrap();
-        assert!(compiled.sql.contains("ev''ents/*.parquet"), "glob quote not escaped");
+        let compiled = compile(
+            &q(QueryKind::Trends),
+            "phc_t",
+            &glob_source("ev'ents/*.parquet"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            compiled.sql.contains("ev''ents/*.parquet"),
+            "glob quote not escaped"
+        );
     }
 
     /// The compiler emits two placeholder spellings — `$P` (rewritten to `?` by
@@ -1168,7 +1432,12 @@ mod tests {
     fn placeholder_count(sql: &str) -> usize {
         let numbered = sql
             .match_indices('$')
-            .filter(|(i, _)| sql[i + 1..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .filter(|(i, _)| {
+                sql[i + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            })
             .count();
         sql.matches("$P").count() + numbered
     }
@@ -1220,7 +1489,10 @@ mod tests {
             let mut query = q(kind);
             query.filters = filtered.clone();
             query.actors_config = Some(ActorsConfig {
-                series_index: 0, day: "2026-08-04".into(), offset: 0, limit: 10,
+                series_index: 0,
+                day: "2026-08-04".into(),
+                offset: 0,
+                limit: 10,
             });
             let c = compile(&query, "phc_t", &src(), None).unwrap();
             assert_eq!(placeholder_count(&c.sql), c.params.len(), "{label}");
@@ -1232,8 +1504,16 @@ mod tests {
     #[test]
     fn intervals_are_distinct() {
         let mut seen = std::collections::HashSet::new();
-        for interval in [Interval::Hour, Interval::Day, Interval::Week, Interval::Month] {
-            assert!(seen.insert(interval_sql(interval)), "{interval:?} duplicates another interval");
+        for interval in [
+            Interval::Hour,
+            Interval::Day,
+            Interval::Week,
+            Interval::Month,
+        ] {
+            assert!(
+                seen.insert(interval_sql(interval)),
+                "{interval:?} duplicates another interval"
+            );
         }
     }
 }

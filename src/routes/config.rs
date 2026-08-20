@@ -5,28 +5,54 @@
 //! degrades gracefully. Features we don't implement are declared off
 //! (`sessionRecording`, `surveys`, `heatmaps`) so the SDK never tries them.
 
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
-    extract::Path,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
 use serde_json::json;
 
-use crate::token;
+use crate::{capture::CaptureAuthorizer, token};
 
+#[derive(Clone)]
+struct ConfigState {
+    authorizer: Option<Arc<dyn CaptureAuthorizer>>,
+}
+
+/// Compatibility constructor for the legacy monolithic application.
 pub fn router() -> Router {
+    routes(ConfigState { authorizer: None })
+}
+
+/// Builds the public SDK config endpoint with fail-closed project-token
+/// authorization.
+pub fn wire_router(authorizer: Arc<dyn CaptureAuthorizer>) -> Router {
+    routes(ConfigState {
+        authorizer: Some(authorizer),
+    })
+}
+
+fn routes(state: ConfigState) -> Router {
     // posthog-js requests both with and without a trailing slash depending on
     // version; serve both.
     Router::new()
         .route("/array/{token}/config", get(config))
         .route("/array/{token}/config/", get(config))
+        .with_state(state)
 }
 
-async fn config(Path(token): Path<String>) -> Response {
+async fn config(State(state): State<ConfigState>, Path(token): Path<String>) -> Response {
     if token::validate(&token).is_err() {
         // Invalid token shape → 401, which posthog-js never retries.
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if let Some(authorizer) = &state.authorizer
+        && authorizer.authorize(&token).await.is_err()
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 

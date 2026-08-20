@@ -99,7 +99,9 @@ pub enum EventMatch {
 }
 
 impl Default for EventMatch {
-    fn default() -> Self { EventMatch::Any }
+    fn default() -> Self {
+        EventMatch::Any
+    }
 }
 
 // ── Math ──────────────────────────────────────────────────────────
@@ -110,6 +112,9 @@ impl Default for EventMatch {
 pub enum Math {
     #[serde(rename = "total")]
     Total,
+    /// Distinct persons within each requested interval.
+    #[serde(rename = "unique_persons")]
+    UniquePersons,
     #[serde(rename = "dau")]
     Dau,
     #[serde(rename = "wau")]
@@ -325,11 +330,18 @@ pub struct Formula {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub enum FunnelOrder { Ordered, Unordered }
+pub enum FunnelOrder {
+    Ordered,
+    Unordered,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub enum FunnelAttribution { FirstTouch, LastTouch, AllSteps }
+pub enum FunnelAttribution {
+    FirstTouch,
+    LastTouch,
+    AllSteps,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
@@ -351,22 +363,33 @@ pub struct FunnelConfig {
 }
 
 impl Default for FunnelOrder {
-    fn default() -> Self { FunnelOrder::Ordered }
+    fn default() -> Self {
+        FunnelOrder::Ordered
+    }
 }
 
 impl Default for FunnelAttribution {
-    fn default() -> Self { FunnelAttribution::AllSteps }
+    fn default() -> Self {
+        FunnelAttribution::AllSteps
+    }
 }
 
 // ── Retention config ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub enum RetentionType { Recurring, FirstTime }
+pub enum RetentionType {
+    Recurring,
+    FirstTime,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub enum RetentionPeriod { Day, Week, Month }
+pub enum RetentionPeriod {
+    Day,
+    Week,
+    Month,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, Default)]
 #[ts(export, export_to = "../web/src/types/")]
@@ -381,19 +404,38 @@ pub struct RetentionConfig {
     pub total_periods: u32,
 }
 
-impl Default for RetentionType { fn default() -> Self { RetentionType::Recurring } }
-impl Default for RetentionPeriod { fn default() -> Self { RetentionPeriod::Day } }
-fn default_total_periods() -> u32 { 10 }
+impl Default for RetentionType {
+    fn default() -> Self {
+        RetentionType::Recurring
+    }
+}
+impl Default for RetentionPeriod {
+    fn default() -> Self {
+        RetentionPeriod::Day
+    }
+}
+fn default_total_periods() -> u32 {
+    10
+}
 
 // ── Lifecycle config ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub enum LifecycleStatus { New, Returning, Resurrecting, Dormant }
+pub enum LifecycleStatus {
+    New,
+    Returning,
+    Resurrecting,
+    Dormant,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
-pub enum LifecyclePeriod { Day, Week, Month }
+pub enum LifecyclePeriod {
+    Day,
+    Week,
+    Month,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
@@ -403,7 +445,11 @@ pub struct LifecycleConfig {
     pub prior_period: LifecyclePeriod,
 }
 
-impl Default for LifecyclePeriod { fn default() -> Self { LifecyclePeriod::Day } }
+impl Default for LifecyclePeriod {
+    fn default() -> Self {
+        LifecyclePeriod::Day
+    }
+}
 
 // ── Stickiness config ──────────────────────────────────────────────
 
@@ -415,7 +461,9 @@ pub struct StickinessConfig {
     pub window_days: u32,
 }
 
-fn default_stickiness_window() -> u32 { 7 }
+fn default_stickiness_window() -> u32 {
+    7
+}
 
 // ── Actors config ──────────────────────────────────────────────────
 
@@ -431,7 +479,9 @@ pub struct ActorsConfig {
     pub limit: usize,
 }
 
-fn default_actors_limit() -> usize { 100 }
+fn default_actors_limit() -> usize {
+    100
+}
 
 // ── SQL access config ──────────────────────────────────────────────
 
@@ -443,14 +493,14 @@ pub struct SqlConfig {
 
 // ── Response types ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub struct QueryResponse {
     pub results: Vec<SeriesResult>,
     pub meta: QueryMeta,
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub struct SeriesResult {
     pub label: String,
@@ -459,7 +509,7 @@ pub struct SeriesResult {
     pub breakdown_value: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub struct DataPoint {
     pub interval: String,
@@ -467,12 +517,14 @@ pub struct DataPoint {
     pub count: i64,
 }
 
-#[derive(Debug, Clone, Serialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../web/src/types/")]
 pub struct QueryMeta {
     pub kind: String,
     #[ts(type = "number")]
     pub elapsed_ms: u64,
+    #[ts(type = "number")]
+    pub generation_id: u64,
     pub cached: bool,
 }
 
@@ -536,7 +588,10 @@ impl Query {
 
     pub fn validate(&self) -> Result<(), IrError> {
         // Series are required for Trends, Funnels, Actors
-        let needs_series = matches!(self.kind, QueryKind::Trends | QueryKind::Funnels | QueryKind::Actors);
+        let needs_series = matches!(
+            self.kind,
+            QueryKind::Trends | QueryKind::Funnels | QueryKind::Actors
+        );
         if needs_series && self.series.is_empty() {
             return Err(IrError::Invalid("at least one series is required"));
         }
@@ -627,7 +682,10 @@ mod tests {
         ));
 
         // ...and remain what we serialize, so the TS types stay honest.
-        assert_eq!(serde_json::to_string(&QueryKind::Trends).unwrap(), "\"Trends\"");
+        assert_eq!(
+            serde_json::to_string(&QueryKind::Trends).unwrap(),
+            "\"Trends\""
+        );
         assert_eq!(serde_json::to_string(&Interval::Day).unwrap(), "\"Day\"");
         assert_eq!(serde_json::to_string(&GroupOp::And).unwrap(), "\"AND\"");
     }

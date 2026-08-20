@@ -46,16 +46,24 @@ impl SessionStore {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(SessionStore { conn: Mutex::new(conn) })
+        Ok(SessionStore {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, SessionError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(SessionStore { conn: Mutex::new(conn) })
+        Ok(SessionStore {
+            conn: Mutex::new(conn),
+        })
     }
 
-    pub fn ingest(&self, events: &[CapturedEvent], token: &str) -> Result<Vec<SessionInfo>, SessionError> {
+    pub fn ingest(
+        &self,
+        events: &[CapturedEvent],
+        token: &str,
+    ) -> Result<Vec<SessionInfo>, SessionError> {
         let sessions = sessionize(events, token);
         let now = Utc::now().timestamp();
         let conn = self.conn.lock().unwrap();
@@ -78,17 +86,29 @@ impl SessionStore {
         let tx = conn.unchecked_transaction()?;
         for session in &sessions {
             stmt.execute(rusqlite::params![
-                &session.session_id, token, &session.distinct_id,
-                session.start_time, session.end_time, session.duration_seconds,
-                session.event_count, &session.entry_event, &session.exit_event,
-                session.is_bounce as i64, now,
+                &session.session_id,
+                token,
+                &session.distinct_id,
+                session.start_time,
+                session.end_time,
+                session.duration_seconds,
+                session.event_count,
+                &session.entry_event,
+                &session.exit_event,
+                session.is_bounce as i64,
+                now,
             ])?;
         }
         tx.commit()?;
         Ok(sessions)
     }
 
-    pub fn sessions_for_person(&self, token: &str, distinct_id: &str, limit: usize) -> Result<Vec<SessionInfo>, SessionError> {
+    pub fn sessions_for_person(
+        &self,
+        token: &str,
+        distinct_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionInfo>, SessionError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare_cached(
             "SELECT session_id, distinct_id,
@@ -101,10 +121,14 @@ impl SessionStore {
         let rows: Vec<SessionInfo> = stmt
             .query_map(rusqlite::params![token, distinct_id, limit as i64], |r| {
                 Ok(SessionInfo {
-                    session_id: r.get(0)?, distinct_id: r.get(1)?,
-                    start_time: r.get(2)?, end_time: r.get(3)?,
-                    duration_seconds: r.get(4)?, event_count: r.get(5)?,
-                    entry_event: r.get(6)?, exit_event: r.get(7)?,
+                    session_id: r.get(0)?,
+                    distinct_id: r.get(1)?,
+                    start_time: r.get(2)?,
+                    end_time: r.get(3)?,
+                    duration_seconds: r.get(4)?,
+                    event_count: r.get(5)?,
+                    entry_event: r.get(6)?,
+                    exit_event: r.get(7)?,
                     is_bounce: r.get::<_, i64>(8)? != 0,
                 })
             })?
@@ -177,7 +201,9 @@ fn sessionize(events: &[CapturedEvent], _token: &str) -> Vec<SessionInfo> {
             };
             if start_new {
                 current_sid = Some(
-                    event.properties.get("$session_id")
+                    event
+                        .properties
+                        .get("$session_id")
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                         .map(|s| s.to_string())
@@ -186,32 +212,53 @@ fn sessionize(events: &[CapturedEvent], _token: &str) -> Vec<SessionInfo> {
             }
             if let Some(ref sid) = current_sid {
                 session_events.entry(sid.clone()).or_default().push(event);
-                session_start.entry(sid.clone()).and_modify(|e| { if event.timestamp < *e { *e = event.timestamp; } }).or_insert(event.timestamp);
-                session_end.entry(sid.clone()).and_modify(|e| { if event.timestamp > *e { *e = event.timestamp; } }).or_insert(event.timestamp);
-                session_entry.entry(sid.clone()).or_insert_with(|| event.event.clone());
+                session_start
+                    .entry(sid.clone())
+                    .and_modify(|e| {
+                        if event.timestamp < *e {
+                            *e = event.timestamp;
+                        }
+                    })
+                    .or_insert(event.timestamp);
+                session_end
+                    .entry(sid.clone())
+                    .and_modify(|e| {
+                        if event.timestamp > *e {
+                            *e = event.timestamp;
+                        }
+                    })
+                    .or_insert(event.timestamp);
+                session_entry
+                    .entry(sid.clone())
+                    .or_insert_with(|| event.event.clone());
                 session_exit.insert(sid.clone(), event.event.clone());
-                session_person.entry(sid.clone()).or_insert_with(|| distinct_id.to_string());
+                session_person
+                    .entry(sid.clone())
+                    .or_insert_with(|| distinct_id.to_string());
             }
             last_ts = Some(event.timestamp);
         }
     }
 
-    session_events.into_iter().map(|(sid, evts)| {
-        let start = session_start.get(&sid).copied().unwrap_or(Utc::now());
-        let end = session_end.get(&sid).copied().unwrap_or(start);
-        let duration = (end.timestamp() - start.timestamp()).max(0);
-        SessionInfo {
-            session_id: sid.clone(),
-            distinct_id: session_person.get(&sid).cloned().unwrap_or_default(),
-            start_time: start.timestamp().to_string(),
-            end_time: end.timestamp().to_string(),
-            duration_seconds: duration,
-            event_count: evts.len() as i64,
-            entry_event: session_entry.get(&sid).cloned().unwrap_or_default(),
-            exit_event: session_exit.get(&sid).cloned().unwrap_or_default(),
-            is_bounce: evts.len() <= 1,
-        }
-    }).collect()
+    session_events
+        .into_iter()
+        .map(|(sid, evts)| {
+            let start = session_start.get(&sid).copied().unwrap_or(Utc::now());
+            let end = session_end.get(&sid).copied().unwrap_or(start);
+            let duration = (end.timestamp() - start.timestamp()).max(0);
+            SessionInfo {
+                session_id: sid.clone(),
+                distinct_id: session_person.get(&sid).cloned().unwrap_or_default(),
+                start_time: start.timestamp().to_string(),
+                end_time: end.timestamp().to_string(),
+                duration_seconds: duration,
+                event_count: evts.len() as i64,
+                entry_event: session_entry.get(&sid).cloned().unwrap_or_default(),
+                exit_event: session_exit.get(&sid).cloned().unwrap_or_default(),
+                is_bounce: evts.len() <= 1,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -221,18 +268,92 @@ mod tests {
     use serde_json::{Map, Value};
     use uuid::Uuid;
 
-    fn timestamp(ago_minutes: i64) -> DateTime<Utc> { Utc::now() - Duration::minutes(ago_minutes) }
+    fn timestamp(ago_minutes: i64) -> DateTime<Utc> {
+        Utc::now() - Duration::minutes(ago_minutes)
+    }
 
     fn ev_with_ts(event: &str, did: &str, ts: DateTime<Utc>, sid: Option<&str>) -> CapturedEvent {
         let mut props = Map::new();
-        if let Some(s) = sid { props.insert("$session_id".into(), Value::String(s.into())); }
-        CapturedEvent { uuid: Uuid::new_v4(), event: event.into(), distinct_id: did.into(), token: "phc_t".into(), timestamp: ts, properties: props }
+        if let Some(s) = sid {
+            props.insert("$session_id".into(), Value::String(s.into()));
+        }
+        CapturedEvent {
+            uuid: Uuid::new_v4(),
+            event: event.into(),
+            distinct_id: did.into(),
+            token: "phc_t".into(),
+            timestamp: ts,
+            properties: props,
+        }
     }
 
-    #[test] fn single_event_is_bounce() { let s = sessionize(&[ev_with_ts("pv", "u1", timestamp(5), None)], "x"); assert_eq!(s.len(), 1); assert!(s[0].is_bounce); }
-    #[test] fn within_30_min_share_session() { let s = sessionize(&[ev_with_ts("a", "u1", timestamp(20), None), ev_with_ts("b", "u1", timestamp(10), None), ev_with_ts("c", "u1", timestamp(5), None)], "x"); assert_eq!(s.len(), 1); assert_eq!(s[0].event_count, 3); }
-    #[test] fn gap_over_30_creates_new() { let s = sessionize(&[ev_with_ts("a", "u1", timestamp(60), None), ev_with_ts("b", "u1", timestamp(20), None)], "x"); assert_eq!(s.len(), 2); }
-    #[test] fn respects_session_id() { let s = sessionize(&[ev_with_ts("a", "u1", timestamp(60), Some("sid_x")), ev_with_ts("b", "u1", timestamp(20), None)], "x"); assert!(s.iter().any(|si| si.session_id == "sid_x")); }
-    #[test] fn different_persons_separate() { let s = sessionize(&[ev_with_ts("a", "u1", timestamp(5), None), ev_with_ts("a", "u2", timestamp(4), None)], "x"); assert_eq!(s.len(), 2); }
-    #[test] fn store_ingest_and_query() { let store = SessionStore::open_in_memory().unwrap(); store.ingest(&[ev_with_ts("pv", "u1", timestamp(20), None), ev_with_ts("cl", "u1", timestamp(10), None)], "phc_t").unwrap(); assert_eq!(store.sessions_for_person("phc_t", "u1", 10).unwrap().len(), 1); }
+    #[test]
+    fn single_event_is_bounce() {
+        let s = sessionize(&[ev_with_ts("pv", "u1", timestamp(5), None)], "x");
+        assert_eq!(s.len(), 1);
+        assert!(s[0].is_bounce);
+    }
+    #[test]
+    fn within_30_min_share_session() {
+        let s = sessionize(
+            &[
+                ev_with_ts("a", "u1", timestamp(20), None),
+                ev_with_ts("b", "u1", timestamp(10), None),
+                ev_with_ts("c", "u1", timestamp(5), None),
+            ],
+            "x",
+        );
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].event_count, 3);
+    }
+    #[test]
+    fn gap_over_30_creates_new() {
+        let s = sessionize(
+            &[
+                ev_with_ts("a", "u1", timestamp(60), None),
+                ev_with_ts("b", "u1", timestamp(20), None),
+            ],
+            "x",
+        );
+        assert_eq!(s.len(), 2);
+    }
+    #[test]
+    fn respects_session_id() {
+        let s = sessionize(
+            &[
+                ev_with_ts("a", "u1", timestamp(60), Some("sid_x")),
+                ev_with_ts("b", "u1", timestamp(20), None),
+            ],
+            "x",
+        );
+        assert!(s.iter().any(|si| si.session_id == "sid_x"));
+    }
+    #[test]
+    fn different_persons_separate() {
+        let s = sessionize(
+            &[
+                ev_with_ts("a", "u1", timestamp(5), None),
+                ev_with_ts("a", "u2", timestamp(4), None),
+            ],
+            "x",
+        );
+        assert_eq!(s.len(), 2);
+    }
+    #[test]
+    fn store_ingest_and_query() {
+        let store = SessionStore::open_in_memory().unwrap();
+        store
+            .ingest(
+                &[
+                    ev_with_ts("pv", "u1", timestamp(20), None),
+                    ev_with_ts("cl", "u1", timestamp(10), None),
+                ],
+                "phc_t",
+            )
+            .unwrap();
+        assert_eq!(
+            store.sessions_for_person("phc_t", "u1", 10).unwrap().len(),
+            1
+        );
+    }
 }

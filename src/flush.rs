@@ -11,8 +11,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::catalog::CatalogStore;
 use crate::capture::event::CapturedEvent;
+use crate::catalog::CatalogStore;
 use crate::session::SessionStore;
 use crate::store::EventStore;
 use crate::wal::{self, Wal};
@@ -100,8 +100,7 @@ pub async fn flush_once(
 
         // Update catalog
         if let Some(cat) = catalog {
-            let tokens: HashSet<String> =
-                all_events.iter().map(|e| e.token.clone()).collect();
+            let tokens: HashSet<String> = all_events.iter().map(|e| e.token.clone()).collect();
             for token in &tokens {
                 let token_events: Vec<CapturedEvent> = all_events
                     .iter()
@@ -114,8 +113,7 @@ pub async fn flush_once(
 
         // Update sessions
         if let Some(sess) = session {
-            let tokens: HashSet<String> =
-                all_events.iter().map(|e| e.token.clone()).collect();
+            let tokens: HashSet<String> = all_events.iter().map(|e| e.token.clone()).collect();
             for token in &tokens {
                 let token_events: Vec<CapturedEvent> = all_events
                     .iter()
@@ -223,7 +221,9 @@ mod tests {
         let catalog = CatalogStore::open_in_memory().unwrap();
 
         let (wal, runtime, _) = Wal::open(wal_dir.clone()).unwrap();
-        wal.append(vec![event("pageview"), event("click")]).await.unwrap();
+        wal.append(vec![event("pageview"), event("click")])
+            .await
+            .unwrap();
 
         flush_once(&wal, &store, Some(Arc::new(catalog)), None)
             .await

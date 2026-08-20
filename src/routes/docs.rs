@@ -12,7 +12,7 @@ use axum::{
     response::{Html, IntoResponse, Json, Response},
     routing::get,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 const SCALAR_JS: &[u8] = include_bytes!("../../web/vendor/scalar.standalone.js");
 
@@ -24,11 +24,7 @@ pub fn router() -> Router {
 }
 
 async fn scalar_js() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/javascript")],
-        SCALAR_JS,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "text/javascript")], SCALAR_JS).into_response()
 }
 
 async fn docs_page() -> Html<&'static str> {
@@ -113,7 +109,7 @@ fn tag(name: &str, desc: &str) -> Value {
 
 /// The OpenAPI 3.1 document describing Hoglet's HTTP surface.
 pub fn spec() -> Value {
-    json!({
+    let mut document = json!({
         "openapi": "3.1.0",
         "info": {
             "title": "Hoglet API",
@@ -194,6 +190,30 @@ pub fn spec() -> Value {
                         "example": { "token": "phc_demo", "distinct_id": "u1", "person_properties": { "plan": "pro" } }
                     }}},
                     "responses": { "200": { "description": "Evaluated flags" }, "401": { "description": "Bad token" } }
+                }
+            },
+            "/api/projects/{project_id}/query": {
+                "post": {
+                    "tags": ["Query"],
+                    "summary": "Run a bounded Trends query",
+                    "description": "Runs the supported Trends subset for an authorized path project. The server derives the project's capture token; request bodies cannot select another tenant. Responses report the immutable EventLake generation used by the query.",
+                    "security": [{"sessionCookie": []}, {"personalBearer": []}],
+                    "parameters": [{
+                        "name": "project_id", "in": "path", "required": true,
+                        "schema": {"type": "string", "format": "uuid"}
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProjectQueryRequest"}}}
+                    },
+                    "responses": {
+                        "200": {"description": "Trends result from one immutable generation"},
+                        "401": {"description": "Authentication required"},
+                        "403": {"description": "Project access denied"},
+                        "422": {"description": "Query shape is outside the supported subset"},
+                        "503": {"description": "Bounded query queue is full"},
+                        "504": {"description": "Query execution deadline exceeded"}
+                    }
                 }
             },
             "/api/stats": {
@@ -296,9 +316,15 @@ pub fn spec() -> Value {
         },
         "components": {
             "securitySchemes": {
-                "adminBearer": { "type": "http", "scheme": "bearer", "description": "HOGLET_ADMIN_TOKEN" }
+                "adminBearer": { "type": "http", "scheme": "bearer", "description": "Legacy operator token" },
+                "sessionCookie": { "type": "apiKey", "in": "cookie", "name": "hoglet_sid" },
+                "personalBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "phx_*" }
             },
             "schemas": {
+                "ProjectQueryRequest": { "type": "object", "required": ["query"], "additionalProperties": false, "properties": {
+                    "query": { "type": "object", "description": "Validated Trends query IR" },
+                    "refresh": { "type": "boolean", "default": false }
+                } },
                 "EventArray": { "type": "array", "items": { "$ref": "#/components/schemas/Event" } },
                 "Event": {
                     "type": "object",
@@ -333,7 +359,177 @@ pub fn spec() -> Value {
                     "variants": { "type": "array", "items": { "$ref": "#/components/schemas/Variant" } } } }
             }
         }
-    })
+    });
+
+    document["info"]["description"] = Value::String(
+        "A documented subset of PostHog's capture/config/decide wire contract, plus Hoglet's authenticated workspace and project APIs. Only the endpoints listed here are mounted by the production application."
+            .into(),
+    );
+    document["tags"] = json!([
+        tag(
+            "Capture",
+            "Supported PostHog-compatible event ingestion aliases."
+        ),
+        tag(
+            "Config",
+            "The supported posthog-js bootstrap configuration."
+        ),
+        tag("Flags", "Supported PostHog-compatible flag evaluation."),
+        tag("Workspace", "Session and personal-key workspace APIs."),
+        tag("Query", "Bounded project-scoped Trends queries."),
+        tag(
+            "Resources",
+            "Project-scoped flags, insights, dashboards, and shares."
+        ),
+        tag("Ops", "Health, readiness, and metrics."),
+    ]);
+
+    let paths = document["paths"]
+        .as_object_mut()
+        .expect("OpenAPI paths are an object");
+    const DETAILED_PRODUCTION_PATHS: &[&str] = &[
+        "/e/",
+        "/batch/",
+        "/array/{token}/config",
+        "/flags/",
+        "/api/projects/{project_id}/query",
+        "/health",
+        "/ready",
+        "/metrics",
+    ];
+    paths.retain(|path, _| DETAILED_PRODUCTION_PATHS.contains(&path.as_str()));
+
+    for (path, methods, tag_name, protected) in [
+        ("/api/auth/bootstrap", &["get"][..], "Workspace", false),
+        ("/api/auth/setup", &["post"][..], "Workspace", false),
+        ("/api/auth/login", &["post"][..], "Workspace", false),
+        ("/api/auth/logout", &["post"][..], "Workspace", true),
+        ("/api/auth/me", &["get"][..], "Workspace", true),
+        ("/api/auth/keys", &["get", "post"][..], "Workspace", true),
+        (
+            "/api/auth/keys/{key_id}",
+            &["delete"][..],
+            "Workspace",
+            true,
+        ),
+        (
+            "/api/organizations",
+            &["get", "post"][..],
+            "Workspace",
+            true,
+        ),
+        (
+            "/api/organizations/{organization_id}/projects",
+            &["post"][..],
+            "Workspace",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/flags",
+            &["get", "post"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/flags/{key}",
+            &["put", "delete"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/catalog/events",
+            &["get"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/catalog/properties",
+            &["get"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/catalog/values",
+            &["get"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/insights",
+            &["get", "post"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/insights/{insight_id}",
+            &["get", "put", "delete"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/dashboards",
+            &["get", "post"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/dashboards/{dashboard_id}",
+            &["get", "put", "delete"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/dashboards/{dashboard_id}/tiles",
+            &["put"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/shares",
+            &["get", "post"][..],
+            "Resources",
+            true,
+        ),
+        (
+            "/api/projects/{project_id}/shares/{share_id}",
+            &["delete"][..],
+            "Resources",
+            true,
+        ),
+        ("/shared/{token}", &["get"][..], "Resources", false),
+    ] {
+        paths.insert(
+            path.into(),
+            documented_operations(methods, tag_name, protected),
+        );
+    }
+
+    if let Some(schemes) = document["components"]["securitySchemes"].as_object_mut() {
+        schemes.remove("adminBearer");
+    }
+    document
+}
+
+fn documented_operations(methods: &[&str], tag_name: &str, protected: bool) -> Value {
+    let mut operations = Map::new();
+    for method in methods {
+        let mut operation = json!({
+            "tags": [tag_name],
+            "summary": "Production endpoint",
+            "responses": {
+                "200": {"description": "Success"},
+                "400": {"description": "Invalid request"},
+                "401": {"description": "Authentication required"},
+                "403": {"description": "Access denied"},
+                "404": {"description": "Resource not found"}
+            }
+        });
+        if protected {
+            operation["security"] = json!([{"sessionCookie": []}, {"personalBearer": []}]);
+        }
+        operations.insert((*method).into(), operation);
+    }
+    Value::Object(operations)
 }
 
 #[cfg(test)]
@@ -345,7 +541,16 @@ mod tests {
         let s = spec();
         assert_eq!(s["openapi"], "3.1.0");
         assert!(s["paths"]["/e/"]["post"].is_object());
-        assert!(s["paths"]["/api/query"].is_null()); // v1, not yet
+        assert!(s["paths"]["/api/projects/{project_id}/query"]["post"].is_object());
+        assert!(s["paths"]["/api/auth/bootstrap"]["get"].is_object());
+        assert!(s["paths"]["/api/projects/{project_id}/dashboards"]["post"].is_object());
+        assert!(s["paths"].get("/api/stats").is_none());
+        assert!(s["paths"].get("/api/admin/projects").is_none());
+        assert!(
+            s["components"]["securitySchemes"]
+                .get("adminBearer")
+                .is_none()
+        );
         assert!(s["components"]["schemas"]["Stats"].is_object());
     }
 }
